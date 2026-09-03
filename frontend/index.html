@@ -1,13 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ar" dir="rtl">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>API Heist Academy</title>
+  <title>API Heist Academy — Hardened</title>
   <link rel="icon" href="data:," />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -15,8 +12,8 @@
     <div class="brand">
       <span class="brand-mark" aria-hidden="true"></span>
       <div>
-        <h1>API Heist Academy</h1>
-        <p class="tagline">One path · 10 teams · 10 challenges</p>
+        <h1>API Heist Academy — Hardened</h1>
+        <p class="tagline">OWASP API Top 10 defensive verification</p>
       </div>
     </div>
     <div id="session-hud" class="team-hud">
@@ -25,8 +22,8 @@
       <span class="timer-label">Session</span>
       <span class="timer" id="hud-timer">100:00</span>
       <span class="timer-state" id="hud-timer-state">Paused</span>
-      <button type="button" class="btn btn-danger btn-reset" data-action="full-reset" title="Clear all progress and start a new session">
-        Clear &amp; start over
+      <button type="button" class="btn btn-danger btn-reset" data-action="full-reset" title="العودة إلى بداية دليل التأمين">
+        إعادة عرض الدليل
       </button>
     </div>
   </header>
@@ -34,33 +31,32 @@
   <main>
     <section id="view-rules" class="view">
       <div class="hero-panel rules-panel">
-        <h2>Session rules</h2>
+        <h2>دليل التحقق بعد تأمين OWASP API Top 10</h2>
         <ul class="rules-list">
-          <li><strong>One shared path.</strong> The whole class works through a single roadmap together — not ten separate games.</li>
-          <li><strong>One team per challenge.</strong> Each team is responsible for exactly one level. When you finish, the next team takes the following challenge.</li>
-          <li><strong>100-minute session clock.</strong> Time counts down while a team is solving. It pauses when a challenge is completed, until the next team starts.</li>
-          <li><strong>When time hits zero, the game stops immediately.</strong> No more flag submits, hints, or progress.</li>
-          <li><strong>Scoring.</strong> Each challenge is worth <strong>15 pts</strong>. Free hint is free. Paid hint −5 (you get 10 pts).</li>
-          <li><strong>Tools.</strong> Use Postman (starter kit) or Burp. Submit flags in this UI.</li>
+          <li><strong>الدخول مفتوح.</strong> تستطيع فتح كل واحدة من الثغرات العشر وقراءة شرحها دون تسجيل فريق ودون الاعتماد على حالة اللعبة القديمة.</li>
+          <li><strong>شرح كامل لكل ثغرة.</strong> ستجد السلوك السابق، السبب الجذري، طريقة التأمين، تغييرات الكود، وطلبات اختبار آمنة مع النتيجة المتوقعة.</li>
+          <li><strong>اختبار دفاعي.</strong> الاختبارات تؤكد أن المحاولات الضارة تُرفض باستجابات 4xx بدل إعادة تفعيل الاستغلال.</li>
+          <li><strong>هوية اختبار اختيارية.</strong> أنشئ فريقًا فقط عندما تحتاج Bearer token لتجربة المسارات المحمية عمليًا.</li>
+          <li><strong>لا توجد Flags.</strong> إرسال الأعلام وFinal Boss متقاعدان بعد التأمين، لأن الهدف الآن إثبات أن الثغرة مغلقة.</li>
         </ul>
-        <button type="button" class="btn btn-primary" data-action="accept-rules">Continue to team setup</button>
+        <button type="button" class="btn btn-primary" data-action="accept-rules">افتح الثغرات العشر المؤمّنة</button>
       </div>
     </section>
 
     <section id="view-register" class="view hidden">
       <div class="hero-panel">
-        <h2>Enter your team name</h2>
-        <p class="muted" id="assign-preview">You will be assigned the next open challenge on the shared path.</p>
+        <h2>إنشاء هوية لاختبار API</h2>
+        <p class="muted" id="assign-preview">التسجيل اختياري، وينشئ ملفًا معزولًا وBearer token لتجربة الطلبات المحمية.</p>
         <form id="register-form" class="register-form">
           <input
             id="team-input"
             type="text"
             maxlength="40"
-            placeholder="Team Alpha"
+            placeholder="اسم فريد، مثال: Team Alpha"
             autocomplete="off"
             required
           />
-          <button type="submit" class="btn btn-primary">Continue</button>
+          <button type="submit" class="btn btn-primary">إنشاء هوية الاختبار</button>
         </form>
       </div>
     </section>
@@ -81,41 +77,33 @@
         <h2>Session over</h2>
         <p class="muted">The 100-minute session clock reached zero. Solving is locked.</p>
         <button type="button" class="btn btn-primary" data-action="open-leaderboard">View scoreboard</button>
-        <button type="button" class="btn btn-danger" data-action="full-reset">Clear &amp; start over</button>
+        <button type="button" class="btn btn-danger" data-action="full-reset">إعادة عرض الدليل</button>
       </div>
     </section>
 
     <section id="view-roadmap" class="view hidden">
       <div class="panel-header">
-        <h2>Shared challenge path</h2>
+        <h2>خريطة الثغرات العشر بعد التأمين</h2>
         <div class="actions">
-          <button class="btn btn-ghost" data-action="hints-help">Scoring</button>
+          <button class="btn btn-ghost" data-action="hints-help">عن وضع التأمين</button>
           <button class="btn btn-ghost" data-action="open-leaderboard">Leaderboard</button>
         </div>
       </div>
       <p class="muted" id="assignment-banner"></p>
       <div class="roadmap">
-        <div class="roadmap-start">Start</div>
+        <div class="roadmap-start">ابدأ من أي ثغرة</div>
         <div id="roadmap-list" class="roadmap-list"></div>
-        <button id="final-boss-card" class="level-card boss locked" type="button">
-          <div class="level-top">
-            <span>Final boss</span>
-            <span class="lock">Locked</span>
-          </div>
-          <p>All teams together — submit every flag</p>
-          <span class="pts">+15 pts</span>
-        </button>
       </div>
       <div class="toolbar">
-        <button class="btn btn-ghost" data-action="open-requests">View requests</button>
-        <button class="btn btn-ghost" data-action="next-team">Pass to next team</button>
-        <button class="btn btn-danger" data-action="full-reset">Clear &amp; start over</button>
+        <button class="btn btn-ghost" data-action="open-requests">عرض جميع المسارات</button>
+        <button class="btn btn-ghost" data-action="next-team">إنشاء هوية لاختبار API</button>
+        <button class="btn btn-danger" data-action="full-reset">إعادة عرض الدليل</button>
       </div>
     </section>
 
     <section id="view-challenge" class="view hidden">
       <div class="panel-header">
-        <button class="btn btn-ghost" data-action="back-roadmap">Back to path</button>
+        <button class="btn btn-ghost" data-action="back-roadmap">العودة إلى الثغرات العشر</button>
       </div>
       <article id="challenge-detail" class="challenge-detail"></article>
     </section>
@@ -128,7 +116,7 @@
       <ol id="leaderboard-list" class="leaderboard"></ol>
       <div id="leaderboard-stats" class="stats-block"></div>
       <div class="toolbar">
-        <button class="btn btn-danger" data-action="full-reset">Clear &amp; start over</button>
+        <button class="btn btn-danger" data-action="full-reset">إعادة عرض الدليل</button>
       </div>
     </section>
   </main>

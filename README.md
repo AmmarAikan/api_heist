@@ -1,180 +1,172 @@
-# API Heist Academy
+# API Heist Academy — Hardened Edition
 
-Interactive classroom lab for **OWASP API Top 10** — one shared path, 10 teams, 10 challenges, one scoreboard.
+Defensive verification application for the **OWASP API Security Top 10 (2023)**. The original classroom release intentionally exposed ten vulnerable API paths; this edition removes the exploit flags and enforces authentication, authorization, validation, resource limits, and safe integration boundaries.
 
-> **Security:** Intentionally vulnerable for education. Bind to `127.0.0.1` only. Do **not** expose this app to the public internet.
+## Attribution
 
----
+- Original intentionally vulnerable classroom lab: [thano-ai/api_heist](https://github.com/thano-ai/api_heist)
+- Security hardening, defensive verification suite, and Arabic remediation report: **Ammar Aikan**
+- Purpose: a defensive coursework contribution that preserves the original repository history and documents the remediation of each OWASP API risk.
+
+> The default server binds to `127.0.0.1`. Use a TLS reverse proxy and explicitly configured secrets before any non-loopback deployment.
+
+## Security model
+
+| Area | Hardened behavior |
+|---|---|
+| Team identity | Registration returns a signed, expiring Bearer token bound to one team and profile |
+| Admin actions | Separate `X-Admin-Token`; admin routes are disabled when it is not configured |
+| Object access | The requested profile ID must match the authenticated token subject |
+| Editable fields | Only `name` and `email` are accepted; role and balance remain server-owned |
+| Resource use | Body-size, registration, request, transfer-count, and transfer-value limits |
+| Outbound fetch | Default-deny, HTTPS-only, exact allowlist, public-IP validation, no redirects, bounded response |
+| Webhooks | HMAC-SHA256 signature, timestamp freshness, event allowlist, bounded JSON, replay prevention |
+| Browser boundary | Same-origin only, CSP and security headers, safe dynamic rendering |
+| Retired surfaces | `/api/v1/users`, `/api/game/submit-flag`, and `/api/ultimate-challenge` return `410` |
+
+The detailed Arabic remediation report is in [`docs/SECURITY_REMEDIATION_REPORT_AR.md`](docs/SECURITY_REMEDIATION_REPORT_AR.md).
+
+## Using the post-remediation guide
+
+Open `http://127.0.0.1:5000` and choose **افتح الثغرات العشر المؤمّنة**. All ten
+controls can be opened without team registration, timer state, shared progress,
+or flags. Each page shows the former risk, root cause, enforced controls, code
+changes, safe negative requests, and expected HTTP results.
+
+Registration is optional and is used only when a protected verification request
+needs a team Bearer token. In hardened mode, **إعادة عرض الدليل** clears only the
+browser's local guide state and never asks for the administrator token. The
+server-wide database reset remains a separate protected API operation.
 
 ## Requirements
 
-- **Python 3.10+** ([download](https://www.python.org/downloads/))
-- **Git** (to clone this repo)
-- A modern browser (Chrome, Edge, or Firefox)
-- Optional: [Postman](https://www.postman.com/downloads/), [Burp Suite Community](https://portswigger.net/burp/communitydownload)
-- Optional: [Docker Desktop](https://www.docker.com/products/docker-desktop/) (alternative install)
+- Python 3.10+
+- Git
+- A modern browser
+- Optional: Docker Desktop
+- Optional: Postman with `postman/API-Heist-Academy.postman_collection.json`
 
----
+## Local setup (PowerShell)
 
-## Step-by-step installation (local)
+From the repository root:
 
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/thano-ai/api_heist.git
-cd api_heist
-```
-
-### 2. Create a virtual environment
-
-**Windows (PowerShell or CMD):**
-
-```bash
-cd backend
+```powershell
 python -m venv .venv
-.\.venv\Scripts\activate
+.\.venv\Scripts\python.exe -m pip install -r .\backend\requirements.txt
 ```
 
-**macOS / Linux:**
+Generate independent high-entropy values for the signing, administrator, and webhook secrets:
 
-```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
+```powershell
+function New-HeistSecret {
+    $bytes = New-Object byte[] 48
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    [Convert]::ToBase64String($bytes)
+}
+
+$env:DVAPI_SECRET = New-HeistSecret
+$env:DVAPI_ADMIN_TOKEN = New-HeistSecret
+$env:DVAPI_WEBHOOK_SECRET = New-HeistSecret
 ```
 
-You should see `(.venv)` in your terminal prompt.
+Start the application:
 
-### 3. Install Python dependencies
-
-```bash
-pip install -r requirements.txt
+```powershell
+.\.venv\Scripts\python.exe .\backend\app.py
 ```
 
-### 4. Start the server
+Open [http://127.0.0.1:5000](http://127.0.0.1:5000).
 
-```bash
-python app.py
+If `DVAPI_SECRET` is omitted on loopback, the app generates an ephemeral signing key and existing tokens expire when the process restarts. Admin and webhook operations remain disabled until their dedicated secrets are configured.
+
+## Authentication flow
+
+Register a new team:
+
+```http
+POST /api/game/register
+Content-Type: application/json
+
+{
+  "teamName": "Alpha",
+  "members": ["Security Student"]
+}
 ```
 
-You should see something like:
+The response includes `accessToken`, `expiresIn`, and `profileId`. Send the token on protected routes:
+
+```http
+Authorization: Bearer <accessToken>
+```
+
+Possession of a different team name is not authentication. The legacy `X-Team-Name` header is ignored.
+
+## Webhook signing
+
+For an exact raw JSON body, compute:
 
 ```text
-API Heist Academy — EDUCATIONAL LAB ONLY
-Serving on http://127.0.0.1:5000
+HMAC-SHA256(DVAPI_WEBHOOK_SECRET, "<unix_timestamp>.<raw_body>")
 ```
 
-Leave this terminal open while the lab is running.
+Then send:
 
-### 5. Open the game
-
-In your browser go to:
-
-**http://127.0.0.1:5000**
-
-(or **http://localhost:5000**)
-
-### 6. Run a session
-
-1. Read the **Session rules** → **Continue to team setup**
-2. Enter a **team name** → add **student names** → continue
-3. On the shared path, click **Start challenge** for your assigned level
-4. Use Postman / Burp against `http://127.0.0.1:5000`
-5. Submit the flag in the UI
-6. When the challenge is done, the timer **pauses** — next team registers
-7. Use **Clear & start over** in the top bar to reset everything
-
-### 7. Stop the server
-
-In the terminal where Flask is running, press **Ctrl+C**.
-
----
-
-## Alternative: Docker install
-
-### 1. Clone (if you have not already)
-
-```bash
-git clone https://github.com/thano-ai/api_heist.git
-cd api_heist
+```http
+X-Webhook-Timestamp: <unix_timestamp>
+X-Webhook-Signature: sha256=<lowercase hex digest>
 ```
 
-### 2. Build and run
+The timestamp must be fresh and an accepted signature can be used only once.
 
-```bash
+## Outbound fetch allowlist
+
+`POST /api/fetch-url` is disabled for all hosts by default. Configure only exact trusted public hosts when the feature is needed:
+
+```powershell
+$env:DVAPI_FETCH_ALLOWLIST = "api.example.com,status.example.com"
+```
+
+HTTP, credentials in URLs, non-standard ports, fragments, redirects, non-public IPs, unlisted hosts, oversized responses, and unexpected content types are rejected.
+
+## Docker
+
+Docker Compose requires `DVAPI_SECRET` to be set. It binds the published port to localhost, runs as a non-root user, drops Linux capabilities, enables `no-new-privileges`, and uses a read-only root filesystem.
+
+```powershell
+$env:DVAPI_SECRET = New-HeistSecret
+$env:DVAPI_ADMIN_TOKEN = New-HeistSecret
+$env:DVAPI_WEBHOOK_SECRET = New-HeistSecret
 docker compose up --build
 ```
 
-### 3. Open the game
+## Verification
 
-**http://127.0.0.1:5000**
+Install test dependencies and run the regression suite:
 
-The container binds to localhost only.
-
-### 4. Stop
-
-```bash
-docker compose down
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r .\backend\requirements-dev.txt
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m pip check
 ```
 
----
-
-## Postman setup (students)
-
-1. Open Postman → **Import**
-2. Select `postman/API-Heist-Academy.postman_collection.json`
-3. Set collection variables:
-   - `baseUrl` = `http://127.0.0.1:5000/api`
-   - `teamName` = your team name (same as in the UI)
-4. Send the starter requests and explore — solutions are intentionally omitted
-
----
+The suite uses a temporary SQLite database and does not modify `backend/heist.db`.
 
 ## Project layout
 
 | Piece | Path |
-|-------|------|
-| Flask API + game logic | `backend/app.py` |
-| UI | `frontend/` |
-| Postman starter kit | `postman/API-Heist-Academy.postman_collection.json` |
-| Student cheat sheet | `docs/STUDENT_CHEAT_SHEET.md` |
-| Burp setup | `docs/BURP_SETUP.md` |
+|---|---|
+| Flask API and security controls | `backend/app.py` |
+| Runtime dependencies | `backend/requirements.txt` |
+| Security regression tests | `tests/` |
+| Hardened browser UI | `frontend/` |
+| Hardened Postman collection | `postman/` |
+| Arabic remediation report | `docs/SECURITY_REMEDIATION_REPORT_AR.md` |
 
----
+## Production notes
 
-## How the session works
-
-- **One shared path** for the whole class (not 10 separate games)
-- **One team per challenge**
-- **100-minute** session clock — runs while solving, **pauses** between challenges
-- At **0:00** the game locks immediately
-- **Clear & start over** resets timer, teams, scores, and progress
-
-## Scoring
-
-- Each challenge: **15 pts**
-- Paid hint: **−5** → **10 pts** on that challenge
-- Free hint: no deduction
-
-## Reset options
-
-- UI button: **Clear & start over** (top bar)
-- API: `POST /api/game/restart` with body `{"fullReset": true}`
-
----
-
-## Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| `python` not found | Install Python 3.10+ and ensure it is on PATH; try `py -3` on Windows |
-| Port 5000 already in use | Stop the other process using 5000, or set `DVAPI_PORT=5001` then open that port |
-| `/api/game/session` returns 404 | An old server is running — stop it and start `python app.py` again from `backend/` |
-| Page looks outdated | Hard refresh: Ctrl+F5 |
-| Dependencies fail to install | Upgrade pip: `python -m pip install --upgrade pip` then retry |
-
----
-
-## License / classroom use
-
-For isolated lab / lecture use only. Do not deploy publicly.
+- Terminate TLS at a trusted reverse proxy and keep the application on a private network.
+- Store secrets in a secrets manager, not source control or image layers.
+- Rotate all secrets if an earlier vulnerable deployment was exposed.
+- Keep `DVAPI_FETCH_ALLOWLIST` empty unless outbound fetching is required.
+- For horizontal multi-host deployment, move rate limiting and replay state from SQLite to a shared transactional store.

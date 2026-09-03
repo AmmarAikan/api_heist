@@ -37,6 +37,14 @@ body {
   position: relative;
 }
 
+.hardened-mode .timer-label,
+.hardened-mode #hud-timer,
+.hardened-mode #hud-timer-state,
+.hardened-mode #hud-points-wrap,
+.hardened-mode [data-action="open-leaderboard"] {
+  display: none !important;
+}
+
 .topbar {
   display: flex;
   justify-content: space-between;
@@ -267,7 +275,7 @@ input:focus {
 
 .level-card {
   width: 100%;
-  text-align: left;
+  text-align: start;
   padding: 1rem 1.15rem;
   border-radius: var(--radius);
   border: 1px solid var(--border);
@@ -367,6 +375,100 @@ input:focus {
   font-size: 1.15rem;
   font-weight: 650;
   letter-spacing: -0.02em;
+}
+
+.guide-intro {
+  color: var(--muted);
+  line-height: 1.8;
+  margin: 0;
+}
+
+.guide-section {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  background: #fff;
+  line-height: 1.8;
+  text-align: start;
+}
+
+.guide-section h3 {
+  color: var(--text);
+  font-size: 0.95rem;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.guide-section p,
+.guide-section ul {
+  margin: 0.45rem 0 0;
+}
+
+.guide-section li + li {
+  margin-top: 0.35rem;
+}
+
+.guide-risk {
+  border-inline-start: 4px solid #d87952;
+  background: #fff8f4;
+}
+
+.guide-cause {
+  border-inline-start: 4px solid var(--yellow);
+  background: #fffdf4;
+}
+
+.guide-fixed {
+  border-inline-start: 4px solid #6bbf8a;
+  background: #f5fcf7;
+}
+
+.guide-code-changes {
+  border-inline-start: 4px solid var(--blue-deep);
+  background: #f5faff;
+}
+
+.guide-code {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+  margin: 0.55rem 0;
+  padding: 0.8rem;
+  border: 1px solid #cfe3f0;
+  border-radius: 9px;
+  background: #eef6fb;
+  color: #214d64;
+  font: 500 0.84rem/1.65 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-align: left;
+}
+
+.verification-card {
+  margin-top: 0.85rem;
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+
+.verification-card h4 {
+  margin: 0 0 0.6rem;
+  font-size: 0.95rem;
+}
+
+.verification-card p {
+  color: #356847;
+  font-weight: 600;
+}
+
+.guide-note {
+  display: block;
+  margin-top: 1rem;
+  padding: 0.9rem 1rem;
+  border-radius: 10px;
+  background: #eef6fb;
+  border: 1px solid #d5e8f4;
+  color: #2a5f7a;
+  line-height: 1.7;
 }
 
 .rule {

@@ -3,17 +3,19 @@
     ? "http://127.0.0.1:5000"
     : "";
 
-  const STORAGE_KEY = "api-heist-academy-state-v2";
+  const STORAGE_KEY = "api-heist-academy-hardening-guide-v3";
+  const TOKEN_KEY = "api-heist-academy-access-token";
 
   const state = {
     rulesAccepted: false,
+    hardened: true,
+    accessToken: sessionStorage.getItem(TOKEN_KEY),
     teamName: null,
     members: [],
     assignedChallenge: null,
     totalPoints: 0,
     challengesMeta: [],
     sessionChallenges: {},
-    flagsFound: [],
     challengeStartedAt: null,
     session: {
       remainingSeconds: 100 * 60,
@@ -26,6 +28,11 @@
   };
 
   const $ = (sel) => document.querySelector(sel);
+  const escapeHtml = (value) =>
+    String(value ?? "").replace(
+      /[&<>'"]/g,
+      (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char]
+    );
   const views = {
     rules: $("#view-rules"),
     register: $("#view-register"),
@@ -45,7 +52,6 @@
         members: state.members,
         assignedChallenge: state.assignedChallenge,
         totalPoints: state.totalPoints,
-        flagsFound: state.flagsFound,
       })
     );
   }
@@ -60,6 +66,8 @@
 
   function clearLocal() {
     localStorage.removeItem(STORAGE_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    state.accessToken = null;
   }
 
   async function api(path, options = {}) {
@@ -67,7 +75,7 @@
       "Content-Type": "application/json",
       ...(options.headers || {}),
     };
-    if (state.teamName) headers["X-Team-Name"] = state.teamName;
+    if (state.accessToken) headers.Authorization = `Bearer ${state.accessToken}`;
     const res = await fetch(`${API}${path}`, { ...options, headers });
     const data = await res.json().catch(() => ({}));
     if (!res.ok && data.error) {
@@ -173,7 +181,7 @@
   async function refreshSession() {
     const { data } = await api("/api/game/session");
     applySession(data);
-    if (data.ended) endGame();
+    if (!state.hardened && data.ended) endGame();
     return data;
   }
 
@@ -242,6 +250,9 @@
   }
 
   async function ensureAssignment() {
+    if (state.hardened) {
+      return resolveAssigned() || 1;
+    }
     if (!state.teamName) return resolveAssigned();
 
     // Prefer existing assignment if that challenge is still open
@@ -278,45 +289,49 @@
   function renderRoadmap() {
     const list = $("#roadmap-list");
     if (!list) return;
-    list.innerHTML = "";
+    list.replaceChildren();
     const assigned = resolveAssigned();
 
     const banner = $("#assignment-banner");
     if (banner) {
-      banner.textContent = assigned
-        ? `Your team owns challenge ${assigned}. Click Start challenge to begin (timer runs while you solve).`
-        : "No challenge assigned yet. Re-register your team or refresh the page.";
+      banner.textContent = state.hardened
+        ? "جميع الصفحات مفتوحة. اختر أي ثغرة لقراءة طريقة تأمينها وتغييرات الكود واختبارات التحقق."
+        : assigned
+          ? `Your team owns challenge ${assigned}. Click Start challenge to begin.`
+          : "No challenge assigned yet. Re-register your team or refresh the page.";
     }
 
     state.challengesMeta.forEach((meta) => {
       const id = Number(meta.id);
       const shared = state.sessionChallenges[id] || {};
       const isAssigned = assigned === id;
-      const locked = !shared.solved && !isAssigned;
+      const locked = state.hardened ? false : !shared.solved && !isAssigned;
       const card = document.createElement("div");
       card.className = "level-card";
       if (locked) card.classList.add("locked");
-      if (shared.solved) card.classList.add("solved");
-      if (isAssigned && !shared.solved) card.classList.add("active");
-      const status = shared.solved
-        ? `Solved${shared.solvedBy ? ` · ${shared.solvedBy}` : ""}`
-        : isAssigned
-          ? "Your challenge"
-          : "Waiting";
+      if (!state.hardened && shared.solved) card.classList.add("solved");
+      if (!state.hardened && isAssigned && !shared.solved) card.classList.add("active");
+      const status = state.hardened
+        ? "مؤمّنة"
+        : shared.solved
+          ? `Solved${shared.solvedBy ? ` · ${shared.solvedBy}` : ""}`
+          : isAssigned
+            ? "Your challenge"
+            : "Waiting";
       card.innerHTML = `
         <div class="level-top">
-          <span>Level ${id}: ${String(meta.title).split("(")[0].trim()}</span>
-          <span class="lock">${status}</span>
+          <span>الثغرة ${id}: ${escapeHtml(String(meta.title).split("(")[0].trim())}</span>
+          <span class="lock">${escapeHtml(status)}</span>
         </div>
-        <p>${meta.codename}</p>
-        <span class="pts">+${meta.points} pts${shared.solved ? ` · ${shared.pointsEarned || 0} earned` : ""}</span>
+        <p>${escapeHtml(meta.codename)}</p>
+        <span class="pts">${state.hardened ? "شرح التأمين + تغييرات الكود + اختبارات آمنة" : `+${meta.points} pts${shared.solved ? ` · ${shared.pointsEarned || 0} earned` : ""}`}</span>
       `;
-      if (isAssigned && !shared.solved) {
+      if (state.hardened || (isAssigned && !shared.solved)) {
         const start = document.createElement("button");
         start.type = "button";
         start.className = "btn btn-primary";
         start.style.marginTop = "0.75rem";
-        start.textContent = "Start challenge";
+        start.textContent = state.hardened ? "افتح شرح التأمين" : "Start challenge";
         start.addEventListener("click", (e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -329,6 +344,8 @@
 
     const boss = $("#final-boss-card");
     if (!boss) return;
+    boss.classList.toggle("hidden", state.hardened);
+    if (state.hardened) return;
     const bossSolved = !!state.sessionChallenges[11]?.solved;
     boss.classList.toggle("locked", !allPathSolved());
     boss.classList.toggle("solved", bossSolved);
@@ -340,7 +357,7 @@
 
   async function openChallenge(id) {
     id = Number(id);
-    if (state.session.ended) {
+    if (!state.hardened && state.session.ended) {
       endGame();
       return;
     }
@@ -350,12 +367,14 @@
       return;
     }
     state.challengeStartedAt = Date.now();
-    try {
-      await resumeTimer();
-    } catch (err) {
-      toast(err.message || "Cannot start timer");
-      if (err.data?.session?.ended) endGame();
-      return;
+    if (!state.hardened) {
+      try {
+        await resumeTimer();
+      } catch (err) {
+        toast(err.message || "Cannot start timer");
+        if (err.data?.session?.ended) endGame();
+        return;
+      }
     }
     saveLocal();
     renderChallenge(meta);
@@ -363,170 +382,128 @@
   }
 
   function renderChallenge(meta) {
-    const shared = state.sessionChallenges[meta.id] || {};
-    const elapsed = Math.floor((Date.now() - state.challengeStartedAt) / 1000);
-    const locked = state.session.ended || shared.solved;
     const root = $("#challenge-detail");
-    root.innerHTML = `
-      <h2>Level ${meta.id}: ${meta.title}</h2>
-      <p class="muted">Students: ${(state.members || []).join(", ") || "—"}</p>
-      <hr class="rule" />
-      <div class="block">
-        <h3>Description</h3>
-        <p>${meta.description}</p>
-      </div>
-      <div class="block">
-        <h3>Objective</h3>
-        <p>${meta.objective}</p>
-      </div>
-      <div class="block">
-        <h3>API endpoint</h3>
-        <code class="endpoint">${meta.endpoint}</code>
-        <p class="muted" style="margin-top:0.5rem">Base: <code>${window.location.origin}/api</code> · Header <code>X-Team-Name: ${state.teamName}</code></p>
-      </div>
-      <div class="block hints">
-        <div class="hint-row">
-          <strong>Hint 1 (free)</strong>
-          <p id="hint-free">${meta.free_hint}</p>
-        </div>
-        <div class="hint-row">
-          <strong>Hint 2 (−5 points)</strong>
-          <p id="hint-paid">Hidden until revealed.</p>
-          <button class="btn btn-ghost" id="reveal-hint" ${locked ? "disabled" : ""}>Reveal hint</button>
-        </div>
-      </div>
-      <div class="block">
-        <h3>Submit flag</h3>
-        <form class="flag-form" id="flag-form">
-          <input name="flag" type="text" placeholder="FLAG{...}" ${locked ? "disabled" : ""} required />
-          <button class="btn btn-primary" type="submit" ${locked ? "disabled" : ""}>Submit flag</button>
-        </form>
-      </div>
-      <div class="meta-bar">
-        <span>Challenge timer: <strong id="chal-time">${formatTime(elapsed)}</strong></span>
-        <span>Status: <span class="status-dot ${shared.solved ? "ok" : ""}"></span> ${shared.solved ? "Solved" : "Open"}</span>
-      </div>
-    `;
+    root.replaceChildren();
+    root.dir = "auto";
+    const title = document.createElement("h2");
+    title.textContent = `الثغرة ${meta.id}: ${meta.title}`;
+    root.appendChild(title);
+    const intro = document.createElement("p");
+    intro.className = "guide-intro";
+    intro.textContent = "هذه الصفحة توثق السلوك السابق، سبب الثغرة، التعديل الدفاعي، وطريقة التحقق أن الاستغلال أصبح محظورًا.";
+    root.appendChild(intro);
+    const rule = document.createElement("hr");
+    rule.className = "rule";
+    root.appendChild(rule);
 
-    $("#reveal-hint")?.addEventListener("click", () => revealPaidHint(meta.id));
-    $("#flag-form")?.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      if (state.session.ended) {
-        endGame();
-        return;
-      }
-      const flag = new FormData(e.target).get("flag");
-      await submitFlag(meta.id, String(flag || "").trim());
+    const addBlock = (heading, text, code = false, tone = "") => {
+      const block = document.createElement("div");
+      block.className = `block guide-section ${tone}`.trim();
+      const label = document.createElement("h3");
+      label.textContent = heading;
+      const value = document.createElement(code ? "pre" : "p");
+      if (code) value.className = "guide-code";
+      value.textContent = text;
+      block.append(label, value);
+      root.appendChild(block);
+    };
+
+    const addList = (heading, values, tone = "") => {
+      const block = document.createElement("section");
+      block.className = `block guide-section ${tone}`.trim();
+      const label = document.createElement("h3");
+      label.textContent = heading;
+      const list = document.createElement("ul");
+      (values || []).forEach((text) => {
+        const item = document.createElement("li");
+        item.textContent = text;
+        list.appendChild(item);
+      });
+      block.append(label, list);
+      root.appendChild(block);
+    };
+
+    const guide = meta.guide || {};
+    addBlock("واجهة API", meta.endpoint, true, "guide-endpoint");
+    addBlock("قبل التأمين: ماذا كانت الثغرة؟", guide.risk_before || meta.description, false, "guide-risk");
+    addBlock("السبب الجذري", guide.root_cause || meta.objective, false, "guide-cause");
+    addList("كيف تم تأمينها؟", guide.controls || [], "guide-fixed");
+    addList("ما الذي تغير في الكود؟", guide.code_changes || [], "guide-code-changes");
+
+    const tests = document.createElement("section");
+    tests.className = "block guide-section guide-tests";
+    const testsTitle = document.createElement("h3");
+    testsTitle.textContent = "كيف نختبر أن الثغرة مغلقة؟";
+    tests.appendChild(testsTitle);
+    (guide.tests || []).forEach((test, index) => {
+      const card = document.createElement("article");
+      card.className = "verification-card";
+      const name = document.createElement("h4");
+      name.textContent = `${index + 1}. ${test.name}`;
+      const requestLabel = document.createElement("strong");
+      requestLabel.textContent = "الطلب:";
+      const requestCode = document.createElement("pre");
+      requestCode.className = "guide-code";
+      requestCode.dir = "ltr";
+      requestCode.textContent = test.request;
+      const expectedLabel = document.createElement("strong");
+      expectedLabel.textContent = "النتيجة المتوقعة:";
+      const expected = document.createElement("p");
+      expected.textContent = test.expected;
+      card.append(name, requestLabel, requestCode, expectedLabel, expected);
+      tests.appendChild(card);
     });
+    root.appendChild(tests);
 
+    const note = document.createElement("aside");
+    note.className = "guide-note";
+    note.textContent = state.accessToken
+      ? "هوية الاختبار جاهزة في هذا المتصفح؛ الطلبات المحمية تستطيع استخدام Bearer token الصادر لفريقك."
+      : "لفحص المسارات المحمية عمليًا، ارجع للخريطة واختر «إنشاء هوية لاختبار API» للحصول على Bearer token. قراءة الشرح لا تحتاج تسجيلًا.";
+    root.appendChild(note);
     clearInterval(renderChallenge._tick);
-    renderChallenge._tick = setInterval(() => {
-      if (shared.solved || !state.challengeStartedAt || state.session.ended) return;
-      const t = Math.floor((Date.now() - state.challengeStartedAt) / 1000);
-      const el = $("#chal-time");
-      if (el) el.textContent = formatTime(t);
-    }, 1000);
-  }
-
-  async function revealPaidHint(challengeId) {
-    if (state.session.ended) {
-      endGame();
-      return;
-    }
-    try {
-      const { data } = await api("/api/game/hint", {
-        method: "POST",
-        body: JSON.stringify({
-          teamName: state.teamName,
-          challengeId,
-          hintIndex: 1,
-        }),
-      });
-      const el = $("#hint-paid");
-      if (el) el.textContent = data.hint;
-      const btn = $("#reveal-hint");
-      if (btn) btn.disabled = true;
-      if (data.pointsDeducted) toast(`Hint revealed (−${data.pointsDeducted} pts on solve)`);
-    } catch (err) {
-      toast(err.message || "Could not reveal hint");
-      if (err.data?.session?.ended) endGame();
-    }
-  }
-
-  async function submitFlag(challengeId, flag) {
-    const elapsed = Math.floor((Date.now() - (state.challengeStartedAt || Date.now())) / 1000);
-    try {
-      const { data } = await api("/api/game/submit-flag", {
-        method: "POST",
-        body: JSON.stringify({
-          teamName: state.teamName,
-          challengeId,
-          flag,
-          timeSeconds: elapsed,
-        }),
-      });
-      if (!data.success) {
-        toast(data.message || "Incorrect flag");
-        return;
-      }
-      applySession(data.session);
-      state.totalPoints += data.points_earned || 0;
-      if (flag && !state.flagsFound.includes(flag)) state.flagsFound.push(flag);
-      saveLocal();
-      celebrate();
-      toast(data.message || "Challenge complete!");
-
-      $("#handoff-title").textContent =
-        challengeId === 11 ? "Final boss complete" : `Challenge ${challengeId} complete`;
-      $("#handoff-body").textContent =
-        challengeId === 11
-          ? "Great work. Check the scoreboard."
-          : "Session timer is paused. Pass the device to the next team so they can register for the next challenge.";
-      showView(challengeId === 11 ? "leaderboard" : "handoff");
-      if (challengeId === 11) await renderLeaderboard();
-    } catch (err) {
-      toast(err.message || "Submit failed");
-      if (err.data?.session?.ended) endGame();
-    }
   }
 
   async function renderLeaderboard() {
     const { data } = await api("/api/game/leaderboard");
     applySession(data.session);
     const list = $("#leaderboard-list");
-    list.innerHTML = "";
+    list.replaceChildren();
     data.teams.forEach((team, idx) => {
       const li = document.createElement("li");
       if (idx === 0) li.classList.add("rank-1");
-      const members = (team.members || []).join(", ");
-      li.innerHTML = `
-        <span>${idx + 1}.</span>
-        <span>${team.name}${members ? `<br><small class="muted">${members}</small>` : ""}${
-          team.assigned_challenge ? `<br><small class="muted">Challenge ${team.assigned_challenge}</small>` : ""
-        }</span>
-        <span>${team.points} pts</span>
-        <span>${formatTime(team.total_time_seconds || 0)}</span>
-      `;
+      [`${idx + 1}.`, team.name, `${team.points} pts`, formatTime(team.total_time_seconds || 0)].forEach(
+        (text) => {
+          const span = document.createElement("span");
+          span.textContent = text;
+          li.appendChild(span);
+        }
+      );
       list.appendChild(li);
     });
     if (!data.teams.length) {
-      list.innerHTML = "<li><span></span><span>No teams yet</span><span></span><span></span></li>";
+      const empty = document.createElement("li");
+      empty.textContent = "No teams yet";
+      list.appendChild(empty);
     }
     const stats = data.stats || {};
-    $("#leaderboard-stats").innerHTML = `
-      <div>Path progress: ${stats.challengesSolved || 0} / ${stats.challengesTotal || 10} challenges</div>
-      <div>Fastest solve: ${
+    const statsRoot = $("#leaderboard-stats");
+    statsRoot.replaceChildren();
+    const statLines = [
+      `Controls reviewed: ${stats.challengesSolved || 0} / ${stats.challengesTotal || 10}`,
+      `Fastest review: ${
         stats.fastestSolve
           ? `${stats.fastestSolve.team} (${formatTime(stats.fastestSolve.seconds)})`
           : "—"
-      }</div>
-      <div>Most hints used: ${
-        stats.mostHints ? `${stats.mostHints.team} (${stats.mostHints.hints} hints)` : "—"
-      }</div>
-      <div>Session time left: ${formatTime(state.session.remainingSeconds)}${
-        state.session.ended ? " (ended)" : state.session.running ? " (running)" : " (paused)"
-      }</div>
-    `;
+      }`,
+      `Most hints used: ${stats.mostHints ? `${stats.mostHints.team} (${stats.mostHints.hints})` : "—"}`,
+      `Session time left: ${formatTime(state.session.remainingSeconds)}`,
+    ];
+    statLines.forEach((text) => {
+      const line = document.createElement("div");
+      line.textContent = text;
+      statsRoot.appendChild(line);
+    });
   }
 
   function openStudentsModal(teamName) {
@@ -586,6 +563,8 @@
         method: "POST",
         body: JSON.stringify({ teamName, members }),
       });
+      state.accessToken = data.accessToken;
+      sessionStorage.setItem(TOKEN_KEY, state.accessToken);
       state.teamName = data.team.name;
       state.members = members;
       state.assignedChallenge = Number(
@@ -607,7 +586,7 @@
     } catch (err) {
       console.error(err);
       toast(err.message || "Registration failed");
-      if (err.data?.session?.ended) {
+      if (!state.hardened && err.data?.session?.ended) {
         closeStudentsModal();
         endGame();
       }
@@ -620,6 +599,8 @@
   }
 
   function resetToNextTeam() {
+    sessionStorage.removeItem(TOKEN_KEY);
+    state.accessToken = null;
     state.teamName = null;
     state.members = [];
     state.assignedChallenge = null;
@@ -636,7 +617,9 @@
       const session = await refreshSession();
       const el = $("#assign-preview");
       if (!el) return;
-      if (session.ended) {
+      if (state.hardened) {
+        el.textContent = "التسجيل اختياري وينشئ ملفًا معزولًا وBearer token لتجربة الطلبات المحمية.";
+      } else if (session.ended) {
         el.textContent = "Session has ended.";
       } else if (session.nextChallenge == null) {
         el.textContent = "All challenges are complete.";
@@ -653,7 +636,7 @@
   function bindActions() {
     $("#register-form").addEventListener("submit", (e) => {
       e.preventDefault();
-      if (state.session.ended) {
+      if (!state.hardened && state.session.ended) {
         endGame();
         return;
       }
@@ -683,8 +666,13 @@
       if (action === "accept-rules") {
         state.rulesAccepted = true;
         saveLocal();
-        await refreshAssignPreview();
-        showView("register");
+        if (state.hardened) {
+          renderRoadmap();
+          showView("roadmap");
+        } else {
+          await refreshAssignPreview();
+          showView("register");
+        }
       }
       if (action === "cancel-students") {
         closeStudentsModal();
@@ -693,16 +681,16 @@
         resetToNextTeam();
       }
       if (action === "back-roadmap") {
-        if (!state.session.ended) await pauseTimer();
+        if (!state.hardened && !state.session.ended) await pauseTimer();
         showView("roadmap");
         renderRoadmap();
       }
       if (action === "back-from-leaderboard") {
-        if (state.session.ended) {
+        if (!state.hardened && state.session.ended) {
           showView("ended");
           return;
         }
-        if (state.teamName) {
+        if (state.hardened || state.teamName) {
           showView("roadmap");
           renderRoadmap();
         } else {
@@ -716,24 +704,32 @@
       if (action === "close-modal") closeModal();
       if (action === "hints-help") {
         openModal(
-          "Scoring",
+          "Hardened mode",
           `<ul>
-            <li>Each challenge: <strong>15 pts</strong></li>
-            <li>Free hint: no deduction</li>
-            <li>Paid hint: <strong>−5 pts</strong> (10 pts on solve)</li>
-            <li>Session clock: <strong>100 minutes</strong> total (pauses between challenges)</li>
+            <li>كل الثغرات العشر مفتوحة للشرح دون تسجيل أو مؤقت.</li>
+            <li>أنشئ هوية اختبار فقط للحصول على Bearer token للمسارات المحمية.</li>
+            <li>إرسال Flags وFinal Boss متقاعدان بعد التأمين.</li>
           </ul>`
         );
       }
       if (action === "open-requests") {
-        const meta = state.challengesMeta.map((c) => `${c.id}. ${c.endpoint}`);
+        const meta = state.challengesMeta.map((c) => escapeHtml(`${c.id}. ${c.endpoint}`));
         openModal(
-          "Challenge endpoints",
-          `<p>Point Postman / Burp at <code>http://127.0.0.1:5000</code></p>
-           <pre>${meta.join("\n")}\n11. POST /api/ultimate-challenge</pre>`
+          "مسارات التحقق",
+          `<p>استخدم <code>http://127.0.0.1:5000</code>، ومع Bearer token عند اختبار المسارات المحمية.</p>
+           <pre>${meta.join("\n")}</pre>`
         );
       }
       if (action === "full-reset") {
+        if (state.hardened) {
+          if (!confirm("العودة إلى بداية دليل التأمين؟\n\nسيتم مسح حالة العرض ورمز الاختبار من هذا المتصفح فقط. لن تُمسح قاعدة البيانات ولن تحتاج رمز المدير.")) {
+            return;
+          }
+          stopPolling();
+          clearLocal();
+          location.reload();
+          return;
+        }
         if (
           !confirm(
             "Clear the whole session?\n\nThis resets the 100-minute timer, all teams, scores, and challenge progress. You will start from the rules page again."
@@ -741,13 +737,17 @@
         ) {
           return;
         }
+        const adminToken = prompt("Enter the administrator token for this one-time reset:");
+        if (!adminToken) return;
         try {
           await api("/api/game/restart", {
             method: "POST",
+            headers: { "X-Admin-Token": adminToken },
             body: JSON.stringify({ fullReset: true }),
           });
         } catch (err) {
-          console.warn("reset API failed, clearing local state anyway", err);
+          toast(err.message || "Administrator reset failed");
+          return;
         }
         stopPolling();
         clearLocal();
@@ -756,53 +756,18 @@
       }
     });
 
-    $("#final-boss-card").addEventListener("click", async () => {
-      if (state.session.ended) {
-        endGame();
-        return;
-      }
-      if (!allPathSolved()) {
-        toast("Solve challenges 1–10 on the shared path first.");
-        return;
-      }
-      if (state.assignedChallenge !== 11 && state.session.nextChallenge !== 11) {
-        // Allow any registered team once path is clear
-      }
-      try {
-        await resumeTimer();
-      } catch (err) {
-        toast(err.message);
-        return;
-      }
-      openModal(
-        "Final boss",
-        `<p>Submit all 10 flags together via Postman, then paste the final flag:</p>
-         <pre>POST /api/ultimate-challenge
-{"flags": [ ...all 10 flags... ]}</pre>
-         <form id="boss-form" class="flag-form">
-           <input name="flag" placeholder="FLAG{Ult1m4te_...}" required />
-           <button class="btn btn-primary" type="submit">Submit final flag</button>
-         </form>`
-      );
-      $("#boss-form")?.addEventListener("submit", async (ev) => {
-        ev.preventDefault();
-        const flag = new FormData(ev.target).get("flag");
-        // Ensure team is assigned to 11 for submit
-        state.assignedChallenge = 11;
-        await submitFlag(11, String(flag).trim());
-        closeModal();
-      });
-    });
   }
 
   async function boot() {
     bindActions();
-    startPolling();
     const { data } = await api("/api/challenges");
     state.challengesMeta = data.challenges;
+    state.hardened = data.mode === "hardened";
+    document.body.classList.toggle("hardened-mode", state.hardened);
+    if (!state.hardened) startPolling();
     await refreshSession();
 
-    if (state.session.ended) {
+    if (!state.hardened && state.session.ended) {
       showView("ended");
       return;
     }
@@ -814,7 +779,6 @@
       state.members = saved.members || [];
       state.assignedChallenge = saved.assignedChallenge;
       state.totalPoints = saved.totalPoints || 0;
-      state.flagsFound = saved.flagsFound || [];
       try {
         const { data: st } = await api(`/api/game/state/${encodeURIComponent(state.teamName)}`);
         applySession(st.session);
@@ -829,12 +793,24 @@
         showView("roadmap");
       } catch {
         clearLocal();
-        showView("rules");
+        if (state.hardened) {
+          state.rulesAccepted = true;
+          saveLocal();
+          renderRoadmap();
+          showView("roadmap");
+        } else {
+          showView("rules");
+        }
       }
     } else if (saved?.rulesAccepted) {
       state.rulesAccepted = true;
-      showView("register");
-      refreshAssignPreview();
+      if (state.hardened) {
+        renderRoadmap();
+        showView("roadmap");
+      } else {
+        showView("register");
+        refreshAssignPreview();
+      }
     } else {
       showView("rules");
     }

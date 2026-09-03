@@ -1,46 +1,74 @@
-"""
-API Heist Academy — Intentionally vulnerable educational lab.
-OWASP API Top 10 training for classroom use only.
-Bind to 127.0.0.1. Do NOT expose to the public internet.
+"""Hardened API Heist Academy service.
+
+The original classroom release intentionally implemented the OWASP API Top 10.
+This edition keeps the API surface for defensive verification while enforcing
+authentication, authorization, validation, and safe outbound integrations.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
+import re
+import secrets
+import socket
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import jwt
 from flask import Flask, g, jsonify, request, send_from_directory
-from flask_cors import CORS
+from werkzeug.exceptions import HTTPException, RequestEntityTooLarge
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("DVAPI_DB", BASE_DIR / "heist.db"))
 STATIC_DIR = BASE_DIR.parent / "frontend"
-SECRET = os.environ.get("DVAPI_SECRET", "super-secret-key-change-me")
 HOST = os.environ.get("DVAPI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DVAPI_PORT", "5000"))
 
-FLAGS = {
-    1: "FLAG{B0L4_G0t_M3_2024}",
-    2: "FLAG{4uth_1s_H4rd_Right}",
-    3: "FLAG{M4ss_4ss1gn_OhNo}",
-    4: "FLAG{R4t3_L1m1t_Byp4ss}",
-    5: "FLAG{Adm1n_Funct10n_Oops}",
-    6: "FLAG{Fl0w_Abus3_Pr0f1t}",
-    7: "FLAG{SSRF_1nt3rn4l_M3t4}",
-    8: "FLAG{Debu9_M0d3_Dang3r}",
-    9: "FLAG{V3rs10n_Exp0s3d}",
-    10: "FLAG{Webh00k_Inj3ct10n}",
-    11: "FLAG{Ult1m4te_H31st_C0mpl3te}",
+JWT_ISSUER = "api-heist-academy"
+JWT_AUDIENCE = "api-heist-api"
+TOKEN_TTL_SECONDS = int(os.environ.get("DVAPI_TOKEN_TTL_SECONDS", "7200"))
+MAX_JSON_BYTES = int(os.environ.get("DVAPI_MAX_JSON_BYTES", "16384"))
+RATE_LIMIT = int(os.environ.get("DVAPI_RATE_LIMIT", "5"))
+RATE_WINDOW_SECONDS = int(os.environ.get("DVAPI_RATE_WINDOW_SECONDS", "60"))
+REGISTRATION_LIMIT = int(os.environ.get("DVAPI_REGISTRATION_LIMIT", "20"))
+REGISTRATION_WINDOW_SECONDS = int(os.environ.get("DVAPI_REGISTRATION_WINDOW_SECONDS", "3600"))
+TRANSFER_LIMIT_PER_WINDOW = int(os.environ.get("DVAPI_TRANSFER_LIMIT", "10"))
+TRANSFER_WINDOW_SECONDS = int(os.environ.get("DVAPI_TRANSFER_WINDOW_SECONDS", "60"))
+TRANSFER_MAX_AMOUNT = int(os.environ.get("DVAPI_TRANSFER_MAX_AMOUNT", "100"))
+TRANSFER_MAX_WINDOW_AMOUNT = int(os.environ.get("DVAPI_TRANSFER_MAX_WINDOW_AMOUNT", "500"))
+WEBHOOK_MAX_AGE_SECONDS = int(os.environ.get("DVAPI_WEBHOOK_MAX_AGE_SECONDS", "300"))
+FETCH_MAX_BYTES = int(os.environ.get("DVAPI_FETCH_MAX_BYTES", "8192"))
+FETCH_ALLOWLIST = {
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("DVAPI_FETCH_ALLOWLIST", "").split(",")
+    if host.strip()
 }
+
+
+def _configured_secret(name: str, *, required_for_remote: bool = False) -> str | None:
+    value = os.environ.get(name)
+    if value and len(value) < 32:
+        raise RuntimeError(f"{name} must contain at least 32 characters")
+    if required_for_remote and HOST not in {"127.0.0.1", "localhost", "::1"} and not value:
+        raise RuntimeError(f"{name} is required when DVAPI_HOST is not loopback")
+    return value
+
+
+# A random local-only signing key is safer than a checked-in default. Remote
+# deployments must provide a stable high-entropy secret explicitly.
+SECRET = _configured_secret("DVAPI_SECRET", required_for_remote=True) or secrets.token_urlsafe(48)
+ADMIN_TOKEN = _configured_secret("DVAPI_ADMIN_TOKEN")
+WEBHOOK_SECRET = _configured_secret("DVAPI_WEBHOOK_SECRET")
 
 CHALLENGES = {
     1: {
@@ -51,13 +79,13 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "GET /api/user/{id}",
         "description": (
-            "The API allows users to view their profile at /api/user/{id}. "
-            "But can you access someone else's?"
+            "Authenticated teams may view only the profile bound to their signed token. "
+            "Other object identifiers are denied."
         ),
-        "objective": "Find the hidden flag by exploiting the ID parameter.",
+        "objective": "Verify that cross-object requests receive HTTP 403.",
         "hints": [
-            "Object references in URLs are often trusted more than they should be.",
-            "Compare several responses. One profile may differ from the others.",
+            "Use the Bearer token returned during team registration.",
+            "The token subject and requested object must match.",
         ],
     },
     2: {
@@ -68,13 +96,13 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "GET /api/admin",
         "description": (
-            "The /api/admin endpoint expects a token. "
-            "Authentication looks solid — until you look closer."
+            "Administrative routes use a dedicated high-entropy credential and reject "
+            "unsigned, forged, or expired team tokens."
         ),
-        "objective": "Reach the admin area and capture the flag.",
+        "objective": "Verify that forged JWTs and team tokens cannot reach admin functions.",
         "hints": [
-            "Tokens are data. What happens if you inspect or reshape that data?",
-            "Servers sometimes check the claim they care about more carefully than how the token was made.",
+            "JWT signatures, issuer, audience, timestamps, and token type are validated.",
+            "Admin actions require X-Admin-Token and are disabled when it is not configured.",
         ],
     },
     3: {
@@ -85,10 +113,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "PUT /api/user/update",
         "description": (
-            "Users can update their profile through a JSON body. "
-            "Ask what the server is willing to accept."
+            "Profile updates accept only the explicitly editable name and email properties. "
+            "Server-owned fields remain immutable."
         ),
-        "objective": "Escalate privileges through the update flow.",
+        "objective": "Verify that role, balance, and unknown fields are rejected.",
         "hints": [
             "Update endpoints sometimes honor fields you never see in the UI.",
             "Think about properties that change who you are — not just your name or email.",
@@ -102,10 +130,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "GET /api/rate-limited",
         "description": (
-            "This endpoint advertises a request limit. "
-            "Limits on paper and limits in practice are not always the same."
+            "This endpoint applies a hard per-team request limit with a fixed time window "
+            "and a Retry-After response."
         ),
-        "objective": "Pressure the endpoint until something unexpected appears.",
+        "objective": "Verify that excess requests remain blocked with HTTP 429.",
         "hints": [
             "Watch how the response changes as traffic increases.",
             "Soft limits and hard limits behave differently when you keep going.",
@@ -119,10 +147,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "DELETE /api/admin/users",
         "description": (
-            "Some routes are meant for administrators only. "
-            "Function-level checks are easy to forget."
+            "Administrative functions enforce a centralized administrator check before "
+            "executing route logic."
         ),
-        "objective": "Reach a privileged function that should have blocked you.",
+        "objective": "Verify that unauthenticated and team-level callers are rejected.",
         "hints": [
             "Naming and HTTP methods can hint at who a route was built for.",
             "Absence of an error is sometimes the vulnerability.",
@@ -136,10 +164,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "POST /api/transfer",
         "description": (
-            "A single transfer looks harmless. "
-            "Business rules often fail when the happy path is repeated."
+            "Transfers enforce amount, balance, velocity, cumulative-value, and "
+            "idempotency controls inside a database transaction."
         ),
-        "objective": "Abuse a legitimate flow until the system gives something up.",
+        "objective": "Verify invalid, duplicate, and excessive transfers are safely handled.",
         "hints": [
             "One request is allowed. What about many?",
             "Automation turns a tiny action into a large effect.",
@@ -153,10 +181,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "POST /api/fetch-url",
         "description": (
-            "This service will fetch a URL on your behalf. "
-            "Where it is willing to reach matters more than what you see in the browser."
+            "Outbound fetches are default-deny, HTTPS-only, allowlisted, redirect-free, "
+            "size-limited, and restricted to public IP addresses."
         ),
-        "objective": "Make the server talk to a place clients should not reach directly.",
+        "objective": "Verify that loopback, link-local, private, and unlisted destinations are denied.",
         "hints": [
             "The interesting destinations are often not on the public internet.",
             "Cloud environments and loopback addresses are classic places to probe carefully.",
@@ -170,10 +198,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "GET /api/debug",
         "description": (
-            "A diagnostics route is exposed. "
-            "Verbose failure modes can say more than success responses."
+            "Debug routes and verbose exception payloads are disabled. API errors are "
+            "generic and security headers are applied centrally."
         ),
-        "objective": "Coax the service into revealing more than it should.",
+        "objective": "Verify that debug probes return HTTP 404 without stack traces.",
         "hints": [
             "Healthy endpoints sometimes still accept unusual query options.",
             "Error pages and stack traces are part of the attack surface.",
@@ -187,10 +215,10 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "GET /api/v2/users",
         "description": (
-            "Documentation points at the current users API. "
-            "Older surfaces are not always retired cleanly."
+            "The deprecated v1 surface is retired with HTTP 410 and successor metadata. "
+            "The current v2 route is authenticated and data-minimized."
         ),
-        "objective": "Find an overlooked API surface that still answers.",
+        "objective": "Verify that v1 exposes no records and v2 returns only the caller's object.",
         "hints": [
             "Version numbers in paths often leave breadcrumbs.",
             "What shipped before the current version may still be listening.",
@@ -204,13 +232,200 @@ CHALLENGES = {
         "points": 15,
         "endpoint": "POST /api/webhook",
         "description": (
-            "Inbound webhook events are accepted as JSON. "
-            "Consumers of external data need skepticism."
+            "Inbound webhooks require an HMAC signature, a fresh timestamp, an allowlisted "
+            "event type, bounded JSON, and replay protection."
         ),
-        "objective": "Craft input the webhook handler handles unsafely.",
+        "objective": "Verify that unsigned, stale, replayed, and unsupported events are rejected.",
         "hints": [
             "Treat every field as untrusted — including ones that look like control signals.",
             "Special names and template-like strings are worth experimenting with.",
+        ],
+    },
+}
+
+# This content powers the post-remediation learning view. It describes safe
+# negative tests and their blocked responses instead of restoring flags.
+HARDENING_GUIDE = {
+    1: {
+        "risk_before": "كان العميل يستطيع تغيير رقم المستخدم في المسار وقراءة كائن لا يملكه، لأن الخادم اعتمد على المعرّف القادم من الطلب دون ربطه بهوية موثقة.",
+        "root_cause": "غياب التحقق من ملكية الكائن بعد المصادقة (Object ownership check).",
+        "controls": [
+            "كل طلب محمي يتطلب Bearer token صالحًا وموقعًا من الخادم.",
+            "هوية الفريق ورقم الملف يؤخذان من الرمز، ويُرفض أي معرّف مختلف بالحالة 403.",
+            "الاستجابة تعرض حقول الملف العامة فقط ولا تكشف الحقول الحساسة.",
+        ],
+        "code_changes": [
+            "authenticate_team() يتحقق من التوقيع وissuer وaudience والصلاحية والnonce.",
+            "require_team يضع الفريق الموثق في g.current_team قبل تنفيذ المسار.",
+            "get_user() يقارن user_id مع معرف الفريق الموثق قبل جلب البيانات.",
+        ],
+        "tests": [
+            {"name": "قراءة الملف المملوك", "request": "GET /api/user/<profileId>\nAuthorization: Bearer <accessToken>", "expected": "HTTP 200، ويطابق user.id قيمة profileId."},
+            {"name": "محاولة BOLA", "request": "GET /api/user/<anotherProfileId>\nAuthorization: Bearer <accessToken>", "expected": "HTTP 403 مع Object access denied، دون بيانات المستخدم الآخر."},
+            {"name": "طلب بلا مصادقة", "request": "GET /api/user/<profileId>", "expected": "HTTP 401."},
+        ],
+    },
+    2: {
+        "risk_before": "كانت آلية المصادقة تسمح بالاعتماد على بيانات يمكن تزويرها أو إعادة استخدامها، وقد تختلط صلاحيات الفريق مع صلاحيات المدير.",
+        "root_cause": "تحقق غير مكتمل من الرمز وعدم فصل اعتماد المدير عن اعتماد المستخدم.",
+        "controls": [
+            "JWT قصير العمر وموقع بسر قوي مع issuer وaudience وiat وnbf وexp.",
+            "nonce عشوائي مخزن للفريق يمنع قبول رمز قديم بعد تدوير الاعتماد.",
+            "عمليات المدير تستخدم X-Admin-Token منفصلًا ولا تقبل رمز الفريق.",
+        ],
+        "code_changes": [
+            "issue_team_token() يصدر claims محددة بزمن ونوع وهوية واضحة.",
+            "authenticate_team() يقيد الخوارزمية إلى HS256 ويتحقق من جميع claims المطلوبة.",
+            "require_admin() يستخدم مقارنة ثابتة الزمن ويعطل الإدارة إن لم يضبط السر.",
+        ],
+        "tests": [
+            {"name": "رمز فريق صحيح", "request": "GET /api/user/<profileId>\nAuthorization: Bearer <accessToken>", "expected": "HTTP 200 للملف المملوك فقط."},
+            {"name": "JWT مزور أو منتهي", "request": "GET /api/user/<profileId>\nAuthorization: Bearer <forged-or-expired-token>", "expected": "HTTP 401 دون تفاصيل عن سبب فشل التوقيع."},
+            {"name": "رمز فريق على مسار مدير", "request": "GET /api/admin\nAuthorization: Bearer <accessToken>", "expected": "HTTP 401؛ يلزم X-Admin-Token المنفصل."},
+        ],
+    },
+    3: {
+        "risk_before": "كان تحديث الملف قد يمرر الخصائص القادمة من JSON مباشرة إلى نموذج المستخدم، ما يسمح بتعديل role أو balance وخصائص غير معروضة في الواجهة.",
+        "root_cause": "ربط جماعي للمدخلات دون قائمة سماح للحقول القابلة للتحرير.",
+        "controls": [
+            "المسموح فقط name وemail.",
+            "أي حقل مجهول أو مملوك للخادم يرفض الطلب كاملًا بالحالة 400.",
+            "تطبق حدود نوع وطول وصيغة على القيم المقبولة.",
+        ],
+        "code_changes": [
+            "update_user() يقارن مفاتيح JSON مع allowed_fields قبل تنفيذ SQL.",
+            "الاستعلام يحدد الأعمدة القابلة للتعديل صراحة بدل بناء استعلام من مدخلات العميل.",
+            "الهوية المستهدفة تأتي من g.current_team لا من جسم الطلب.",
+        ],
+        "tests": [
+            {"name": "تعديل مسموح", "request": "PUT /api/user/update\nAuthorization: Bearer <accessToken>\n\n{\"name\":\"New Name\",\"email\":\"new@example.test\"}", "expected": "HTTP 200 مع بقاء role=user وbalance دون تغيير."},
+            {"name": "Mass assignment", "request": "PUT /api/user/update\nAuthorization: Bearer <accessToken>\n\n{\"role\":\"admin\",\"balance\":999999}", "expected": "HTTP 400 ويعرض أسماء الحقول المرفوضة فقط."},
+        ],
+    },
+    4: {
+        "risk_before": "كان بالإمكان تكرار الطلبات بكثافة دون حد صلب، مما يستهلك موارد الخدمة ويؤثر في توافرها.",
+        "root_cause": "غياب حد طلبات ذري مرتبط بهوية موثقة ونافذة زمنية واضحة.",
+        "controls": [
+            "حد ثابت لكل فريق داخل نافذة زمنية.",
+            "التحديث داخل BEGIN IMMEDIATE لمنع تجاوز الحد عبر الطلبات المتزامنة.",
+            "الطلبات الزائدة تبقى 429 وتحتوي Retry-After.",
+        ],
+        "code_changes": [
+            "rate_limited() يستخدم جدول rate_limits بدل عداد في الذاكرة.",
+            "المفتاح مرتبط بالفريق الموثق وليس بهيدر يختاره العميل.",
+            "لا توجد استجابة نجاح أو flag بعد بلوغ الحد.",
+        ],
+        "tests": [
+            {"name": "اختبار الحد الصلب", "request": "أرسل GET /api/rate-limited ثماني مرات بنفس Bearer token.", "expected": "أول 5 طلبات HTTP 200، ثم كل الطلبات الزائدة HTTP 429 مع Retry-After."},
+        ],
+    },
+    5: {
+        "risk_before": "كان مجرد معرفة مسار إداري أو استخدام DELETE قد يسمح لمستخدم عادي بتنفيذ وظيفة أعلى من مستوى صلاحيته.",
+        "root_cause": "عدم تطبيق تفويض وظيفي مركزي على المسارات الإدارية.",
+        "controls": [
+            "كل وظيفة إدارية محاطة بـ require_admin.",
+            "رمز الفريق لا يمنح صلاحية إدارية حتى لو حمل claim مزورة.",
+            "اعتماد المدير منفصل وعالي العشوائية ويقارن ثابت الزمن.",
+        ],
+        "code_changes": [
+            "require_admin() أصبح بوابة موحدة قبل منطق المسار.",
+            "delete_users() وadmin_panel() لا ينفذان قبل نجاح X-Admin-Token.",
+            "تعطّل الوظائف الإدارية بالحالة 503 إن لم يضبط اعتماد المدير.",
+        ],
+        "tests": [
+            {"name": "بلا اعتماد مدير", "request": "DELETE /api/admin/users", "expected": "HTTP 401 ولا يحذف أي مستخدم."},
+            {"name": "باستخدام رمز فريق", "request": "DELETE /api/admin/users\nAuthorization: Bearer <accessToken>", "expected": "HTTP 401؛ Bearer token لا يعادل X-Admin-Token."},
+        ],
+    },
+    6: {
+        "risk_before": "كان تدفق التحويل يقبل مبالغ سالبة أو تكرارًا آليًا أو إعادة إرسال الطلب، مما يسمح بتغيير الرصيد خارج قواعد العمل.",
+        "root_cause": "التحقق من الطلب منفردًا دون ضوابط قيمة وتكرار وسرعة ومعاملة ذرية.",
+        "controls": [
+            "المبلغ عدد صحيح موجب لا يتجاوز الحد وبوجود رصيد كافٍ.",
+            "Idempotency-Key إلزامي ويمنع تنفيذ الطلب نفسه مرتين.",
+            "حد لعدد التحويلات ومجموع قيمتها داخل النافذة الزمنية.",
+        ],
+        "code_changes": [
+            "transfer() ينفذ التحقق والخصم والتسجيل داخل معاملة BEGIN IMMEDIATE.",
+            "جدول transfer_idempotency يحفظ نتيجة المفتاح ويعيدها دون خصم جديد.",
+            "جدول transfers يتيح حساب السرعة والقيمة التراكمية قبل التنفيذ.",
+        ],
+        "tests": [
+            {"name": "مبلغ غير صالح", "request": "POST /api/transfer\nAuthorization: Bearer <accessToken>\nIdempotency-Key: negative-1\n\n{\"to\":\"Bob\",\"amount\":-10}", "expected": "HTTP 400 دون تغيير الرصيد."},
+            {"name": "إعادة نفس الطلب", "request": "أرسل تحويلًا صالحًا مرتين بنفس Idempotency-Key.", "expected": "HTTP 200 للمرتين، والثانية idempotent_replay=true دون خصم جديد."},
+            {"name": "تجاوز القيمة التراكمية", "request": "أرسل تحويلات صالحة بمفاتيح مختلفة حتى تتجاوز حد النافذة.", "expected": "HTTP 429 عند تجاوز الحد."},
+        ],
+    },
+    7: {
+        "risk_before": "كان الخادم يجلب أي URL يرسله العميل، بما في ذلك loopback أو العناوين الخاصة وخدمة metadata السحابية.",
+        "root_cause": "جلب URL غير موثوق دون سياسة وجهات أو تحقق DNS أو منع التحويلات.",
+        "controls": [
+            "السياسة Default-deny وتسمح فقط بـ HTTPS ومضيف موجود حرفيًا في allowlist.",
+            "كل عناوين DNS يجب أن تكون عامة؛ تحظر private وloopback وlink-local وغيرها.",
+            "التحويلات ممنوعة وحجم الاستجابة والمهلة محدودان.",
+        ],
+        "code_changes": [
+            "fetch_host_is_allowed() يطبق مطابقة مضيف دقيقة بدل substring.",
+            "host_resolves_publicly() يفحص جميع نتائج DNS باستخدام ipaddress.",
+            "fetch_url() يعطل redirects ويقيد scheme والمنفذ والحجم والمهلة.",
+        ],
+        "tests": [
+            {"name": "خدمة metadata", "request": "POST /api/fetch-url\nAuthorization: Bearer <accessToken>\n\n{\"url\":\"http://169.254.169.254/latest/meta-data/\"}", "expected": "HTTP 400 قبل أي اتصال خارجي."},
+            {"name": "مضيف HTTPS غير مسموح", "request": "POST /api/fetch-url\nAuthorization: Bearer <accessToken>\n\n{\"url\":\"https://example.com\"}", "expected": "HTTP 403 عندما لا يكون المضيف ضمن DVAPI_FETCH_ALLOWLIST."},
+        ],
+    },
+    8: {
+        "risk_before": "كانت مسارات التصحيح ورسائل الخطأ قد تكشف stack trace أو إعدادات وأسرار، كما قد تغيب ترويسات الحماية الأساسية.",
+        "root_cause": "إبقاء أدوات التطوير ورسائل الأخطاء التفصيلية ضمن سطح الإنتاج.",
+        "controls": [
+            "مسار /api/debug غير موجود والاستثناءات غير المتوقعة تعاد برسالة عامة.",
+            "CSP وX-Frame-Options وnosniff وسياسات cache/referrer تطبق مركزيًا.",
+            "CORS غير مفتوح افتراضيًا ولا توجد أسرار ثابتة داخل المصدر.",
+        ],
+        "code_changes": [
+            "debug_endpoint() يعيد 404 دون معلومات داخلية.",
+            "handle_unexpected_error() لا يرسل تفاصيل الاستثناء للعميل.",
+            "security_headers() يضيف ترويسات الدفاع لكل استجابة.",
+        ],
+        "tests": [
+            {"name": "فحص debug", "request": "GET /api/debug?crash=1", "expected": "HTTP 404؛ لا traceback ولا flag ولا أسرار."},
+            {"name": "فحص الترويسات", "request": "GET /health", "expected": "توجد CSP وX-Frame-Options: DENY وX-Content-Type-Options: nosniff."},
+        ],
+    },
+    9: {
+        "risk_before": "كانت نسخة API قديمة تظل متاحة وتعرض بيانات أكثر من النسخة الحالية، فتصبح واجهة ظل يمكن تجاوز الضوابط عبرها.",
+        "root_cause": "غياب جرد وإيقاف واضح للإصدارات القديمة مع اختلاف ضوابط الوصول.",
+        "controls": [
+            "الإصدار v1 متقاعد ويرد 410 دون سجلات.",
+            "الإصدار v2 يتطلب Bearer token ويعيد سجل المتصل فقط.",
+            "ترويسات Deprecation وLink توضح الإصدار البديل دون إبقاء الوظيفة القديمة.",
+        ],
+        "code_changes": [
+            "users_v1() يعيد 410 وبيانات انتقال فقط.",
+            "users_v2() محمي بـ require_team ويقلل الحقول إلى id وname.",
+            "لا يوجد مسار قديم بديل يعيد قائمة المستخدمين.",
+        ],
+        "tests": [
+            {"name": "الإصدار المتقاعد", "request": "GET /api/v1/users", "expected": "HTTP 410 مع Deprecation: true ودون مصفوفة users."},
+            {"name": "الإصدار الحالي", "request": "GET /api/v2/users\nAuthorization: Bearer <accessToken>", "expected": "HTTP 200 وسجل واحد للمتصل؛ وHTTP 401 دون الرمز."},
+        ],
+    },
+    10: {
+        "risk_before": "كان webhook يثق في JSON القادم من خدمة خارجية دون إثبات المصدر أو الحداثة، ما يسمح بحقن أحداث أو إعادة الطلب المقبول.",
+        "root_cause": "استهلاك بيانات طرف ثالث كأنها موثوقة دون توقيع ومخطط ومنع replay.",
+        "controls": [
+            "HMAC-SHA256 على timestamp والنص الخام للجسم باستخدام سر مشترك.",
+            "نافذة زمنية قصيرة ونوع حدث allowlisted وحجم JSON محدود.",
+            "بصمة التوقيع تخزن لمنع إعادة نفس الرسالة.",
+        ],
+        "code_changes": [
+            "webhook() يتحقق من X-Webhook-Timestamp وX-Webhook-Signature قبل معالجة JSON.",
+            "hmac.compare_digest يمنع مقارنة توقيع غير آمنة.",
+            "جدول webhook_replays يسجل البصمة داخل معاملة ويعيد 409 عند التكرار.",
+        ],
+        "tests": [
+            {"name": "Webhook بلا توقيع", "request": "POST /api/webhook\nContent-Type: application/json\n\n{\"event\":\"ping\",\"payload\":\"hello\"}", "expected": "HTTP 401."},
+            {"name": "Webhook صحيح", "request": "احسب HMAC على <timestamp>.<raw-body> وأرسل الترويسات المطلوبة.", "expected": "HTTP 202 للمرة الأولى، ثم HTTP 409 عند إعادة الرسالة نفسها."},
         ],
     },
 }
@@ -224,19 +439,178 @@ DEMO_USERS = [
         "email": "carol@heist.local",
         "role": "user",
         "balance": 999,
-        "secret_note": FLAGS[1],
     },
     {"id": 4, "name": "Dave", "email": "dave@heist.local", "role": "user", "balance": 40},
 ]
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = MAX_JSON_BYTES
+
+
+def api_error(message: str, status: int, **extra: Any):
+    payload = {"error": message}
+    payload.update(extra)
+    response = jsonify(payload)
+    if status == 401:
+        response.headers["WWW-Authenticate"] = 'Bearer realm="api-heist"'
+    return response, status
+
+
+def _bearer_token() -> str | None:
+    header = request.headers.get("Authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
+def issue_team_token(team: sqlite3.Row) -> str:
+    now = datetime.now(timezone.utc)
+    claims = {
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
+        "sub": f"team:{team['id']}",
+        "team_id": int(team["id"]),
+        "team": team["name"],
+        "user_id": int(team["id"]),
+        "role": "team",
+        "nonce": team["auth_nonce"],
+        "iat": now,
+        "nbf": now,
+        "exp": now + timedelta(seconds=TOKEN_TTL_SECONDS),
+    }
+    return jwt.encode(claims, SECRET, algorithm="HS256")
+
+
+def authenticate_team() -> tuple[sqlite3.Row | None, Any | None]:
+    token = _bearer_token()
+    if not token:
+        return None, api_error("Authentication required", 401)
+    try:
+        claims = jwt.decode(
+            token,
+            SECRET,
+            algorithms=["HS256"],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+            leeway=5,
+            options={"require": ["exp", "iat", "nbf", "iss", "aud", "sub"]},
+        )
+        team_id = int(claims.get("team_id"))
+    except (jwt.InvalidTokenError, TypeError, ValueError):
+        return None, api_error("Invalid or expired access token", 401)
+
+    if claims.get("role") != "team" or claims.get("sub") != f"team:{team_id}":
+        return None, api_error("Invalid or expired access token", 401)
+    team = get_db().execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
+    nonce = str(claims.get("nonce") or "")
+    if (
+        not team
+        or claims.get("team") != team["name"]
+        or not nonce
+        or not hmac.compare_digest(nonce, str(team["auth_nonce"] or ""))
+    ):
+        return None, api_error("Invalid or expired access token", 401)
+    g.auth_claims = claims
+    return team, None
+
+
+def require_team(view):
+    @wraps(view)
+    def wrapped(*args: Any, **kwargs: Any):
+        team, error = authenticate_team()
+        if error:
+            return error
+        g.current_team = team
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def authenticate_admin() -> Any | None:
+    if not ADMIN_TOKEN:
+        return api_error("Admin operations are disabled until DVAPI_ADMIN_TOKEN is configured", 503)
+    supplied = request.headers.get("X-Admin-Token", "")
+    if not supplied or not hmac.compare_digest(supplied, ADMIN_TOKEN):
+        return api_error("Administrator authentication required", 401)
+    return None
+
+
+def require_admin(view):
+    @wraps(view)
+    def wrapped(*args: Any, **kwargs: Any):
+        error = authenticate_admin()
+        if error:
+            return error
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+def public_team(team: sqlite3.Row, *, include_members: bool = True) -> dict[str, Any]:
+    result = {
+        "name": team["name"],
+        "points": int(team["points"]),
+        "hints_used": int(team["hints_used"]),
+        "total_time_seconds": int(team["total_time_seconds"]),
+        "assigned_challenge": team["assigned_challenge"],
+    }
+    if include_members:
+        result["members"] = json.loads(team["members"] or "[]")
+    return result
+
+
+def clean_text(value: Any, *, field: str, maximum: int) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError(f"{field} is required")
+    if len(cleaned) > maximum:
+        raise ValueError(f"{field} is too long")
+    if any(ord(char) < 32 for char in cleaned):
+        raise ValueError(f"{field} contains control characters")
+    return cleaned
+
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+    )
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    if request.is_secure:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_: RequestEntityTooLarge):
+    return api_error("Request body too large", 413)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc: Exception):
+    if isinstance(exc, HTTPException):
+        if request.path.startswith("/api/"):
+            return api_error(exc.name, exc.code or 500)
+        return exc
+    app.logger.exception("Unhandled request failure")
+    return api_error("Internal server error", 500)
 
 
 def get_db() -> sqlite3.Connection:
     if "db" not in g:
         g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA busy_timeout = 5000")
     return g.db
 
 
@@ -250,6 +624,9 @@ def close_db(_: Any) -> None:
 def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH)
+    db.execute("PRAGMA foreign_keys = ON")
+    db.execute("PRAGMA busy_timeout = 5000")
+    db.execute("PRAGMA journal_mode = WAL")
     db.executescript(
         """
         CREATE TABLE IF NOT EXISTS teams (
@@ -260,7 +637,16 @@ def init_db() -> None:
             created_at TEXT NOT NULL,
             total_time_seconds INTEGER NOT NULL DEFAULT 0,
             members TEXT NOT NULL DEFAULT '[]',
-            assigned_challenge INTEGER
+            assigned_challenge INTEGER,
+            auth_nonce TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS team_accounts (
+            team_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            balance INTEGER NOT NULL DEFAULT 1000,
+            FOREIGN KEY(team_id) REFERENCES teams(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS challenge_progress (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -296,7 +682,28 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS transfer_counters (
             team_key TEXT PRIMARY KEY,
-            count INTEGER NOT NULL DEFAULT 0
+            count INTEGER NOT NULL DEFAULT 0,
+            window_start REAL NOT NULL DEFAULT 0,
+            total_amount INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS registration_counters (
+            client_key TEXT PRIMARY KEY,
+            count INTEGER NOT NULL DEFAULT 0,
+            window_start REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_key TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            from_user_id INTEGER NOT NULL,
+            to_user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            created_at REAL NOT NULL,
+            UNIQUE(team_key, idempotency_key)
+        );
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            signature TEXT PRIMARY KEY,
+            received_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS users_demo (
             id INTEGER PRIMARY KEY,
@@ -314,6 +721,27 @@ def init_db() -> None:
         db.execute("ALTER TABLE teams ADD COLUMN members TEXT NOT NULL DEFAULT '[]'")
     if "assigned_challenge" not in cols:
         db.execute("ALTER TABLE teams ADD COLUMN assigned_challenge INTEGER")
+    if "auth_nonce" not in cols:
+        db.execute("ALTER TABLE teams ADD COLUMN auth_nonce TEXT")
+    for row in db.execute("SELECT id FROM teams WHERE auth_nonce IS NULL OR auth_nonce = ''").fetchall():
+        db.execute(
+            "UPDATE teams SET auth_nonce = ? WHERE id = ?",
+            (secrets.token_urlsafe(32), row[0]),
+        )
+    for team_id, team_name in db.execute("SELECT id, name FROM teams").fetchall():
+        db.execute(
+            """
+            INSERT OR IGNORE INTO team_accounts (team_id, name, email, role, balance)
+            VALUES (?, ?, ?, 'user', 1000)
+            """,
+            (team_id, team_name, f"team-{team_id}@heist.local"),
+        )
+
+    transfer_cols = {r[1] for r in db.execute("PRAGMA table_info(transfer_counters)").fetchall()}
+    if "window_start" not in transfer_cols:
+        db.execute("ALTER TABLE transfer_counters ADD COLUMN window_start REAL NOT NULL DEFAULT 0")
+    if "total_amount" not in transfer_cols:
+        db.execute("ALTER TABLE transfer_counters ADD COLUMN total_amount INTEGER NOT NULL DEFAULT 0")
 
     if db.execute("SELECT COUNT(*) FROM game_session").fetchone()[0] == 0:
         db.execute(
@@ -428,33 +856,16 @@ def require_session_active(db: sqlite3.Connection) -> tuple[dict[str, Any] | Non
 
 
 def team_key_from_request() -> str:
-    return (
-        request.headers.get("X-Team-Name")
-        or request.args.get("team")
-        or (request.json or {}).get("team")
-        or request.remote_addr
-        or "anonymous"
-    )
+    team = getattr(g, "current_team", None)
+    if not team:
+        raise RuntimeError("Authenticated team context required")
+    return f"team:{team['id']}"
 
 
-def ok(message: str, flag: str | None = None, **extra: Any):
+def ok(message: str, **extra: Any):
     payload = {
-        "success": bool(flag),
+        "success": True,
         "message": message,
-        "flag": flag,
-        "hint_used": False,
-    }
-    if flag:
-        payload["points_earned"] = extra.pop("points_earned", 15)
-    payload.update(extra)
-    return jsonify(payload)
-
-
-def fail(message: str = "Try harder!", **extra: Any):
-    payload = {
-        "success": False,
-        "message": message,
-        "flag": None,
         "hint_used": False,
     }
     payload.update(extra)
@@ -462,13 +873,10 @@ def fail(message: str = "Try harder!", **extra: Any):
 
 
 def track_request(challenge_id: int) -> None:
-    name = request.headers.get("X-Team-Name")
-    if not name:
-        return
-    db = get_db()
-    team = db.execute("SELECT id FROM teams WHERE name = ?", (name,)).fetchone()
+    team = getattr(g, "current_team", None)
     if not team:
         return
+    db = get_db()
     db.execute(
         """
         INSERT INTO challenge_progress (team_id, challenge_id, requests)
@@ -500,40 +908,80 @@ def list_challenges():
                 "description": meta["description"],
                 "objective": meta["objective"],
                 "free_hint": meta["hints"][0],
+                "guide": HARDENING_GUIDE[cid],
             }
         )
-    return jsonify({"challenges": items, "final_boss": True})
+    return jsonify({"challenges": items, "final_boss": False, "mode": "hardened"})
 
 
 @app.post("/api/game/register")
 def register_team():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("teamName") or data.get("name") or "").strip()
-    members = data.get("members") or []
-    if not name:
-        return jsonify({"error": "Team name required"}), 400
-    if len(name) > 40:
-        return jsonify({"error": "Team name too long"}), 400
-    if not isinstance(members, list):
-        return jsonify({"error": "members must be a list"}), 400
-    clean_members = [str(m).strip() for m in members if str(m).strip()]
-    if not clean_members:
-        return jsonify({"error": "Add at least one student name"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    try:
+        name = clean_text(data.get("teamName") or data.get("name"), field="teamName", maximum=40)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    members = data.get("members")
+    if not isinstance(members, list) or not (1 <= len(members) <= 10):
+        return api_error("members must contain between 1 and 10 names", 400)
+    try:
+        clean_members = [clean_text(member, field="member", maximum=60) for member in members]
+    except ValueError as exc:
+        return api_error(str(exc), 400)
 
     db = get_db()
-    session, err = require_session_active(db)
-    if err:
-        return err
+    now = time.time()
+    client_key = hashlib.sha256((request.remote_addr or "unknown").encode("utf-8")).hexdigest()
+    db.execute("BEGIN IMMEDIATE")
+    registration = db.execute(
+        "SELECT * FROM registration_counters WHERE client_key = ?", (client_key,)
+    ).fetchone()
+    if not registration or now - float(registration["window_start"]) >= REGISTRATION_WINDOW_SECONDS:
+        if registration:
+            db.execute(
+                "UPDATE registration_counters SET count = 1, window_start = ? WHERE client_key = ?",
+                (now, client_key),
+            )
+        else:
+            db.execute(
+                "INSERT INTO registration_counters (client_key, count, window_start) VALUES (?, 1, ?)",
+                (client_key, now),
+            )
+        db.commit()
+    elif int(registration["count"]) >= REGISTRATION_LIMIT:
+        retry_after = max(
+            1,
+            int(
+                REGISTRATION_WINDOW_SECONDS
+                - (now - float(registration["window_start"]))
+            ),
+        )
+        db.commit()
+        response = jsonify({"error": "Registration rate limit exceeded"})
+        response.headers["Retry-After"] = str(retry_after)
+        return response, 429
+    else:
+        db.execute(
+            "UPDATE registration_counters SET count = count + 1 WHERE client_key = ?",
+            (client_key,),
+        )
+        db.commit()
 
-    assigned = session["nextChallenge"]
-    if assigned is None:
-        return jsonify({"error": "All challenges are already complete"}), 400
-    if assigned == 11:
-        # Final boss — allow a team to register for it
-        pass
+    # In hardened mode registration is optional and exists only to mint an
+    # isolated token for hands-on negative tests. A completed legacy game
+    # session must not prevent access to that testing identity.
+    session = read_session(db)
+    assigned = 1
 
     existing = db.execute("SELECT * FROM teams WHERE name = ?", (name,)).fetchone()
     if existing:
+        authenticated, auth_error = authenticate_team()
+        if auth_error:
+            return auth_error
+        if authenticated["id"] != existing["id"]:
+            return api_error("The access token does not own this team", 403)
         db.execute(
             "UPDATE teams SET members = ?, assigned_challenge = ? WHERE id = ?",
             (json.dumps(clean_members), existing["assigned_challenge"] or assigned, existing["id"]),
@@ -542,7 +990,11 @@ def register_team():
         team = db.execute("SELECT * FROM teams WHERE id = ?", (existing["id"],)).fetchone()
         return jsonify(
             {
-                "team": {**dict(team), "members": clean_members},
+                "team": public_team(team),
+                "accessToken": issue_team_token(team),
+                "tokenType": "Bearer",
+                "expiresIn": TOKEN_TTL_SECONDS,
+                "profileId": int(team["id"]),
                 "assignedChallenge": team["assigned_challenge"] or assigned,
                 "resumed": True,
                 "session": read_session(db),
@@ -552,12 +1004,19 @@ def register_team():
 
     cur = db.execute(
         """
-        INSERT INTO teams (name, points, hints_used, created_at, members, assigned_challenge)
-        VALUES (?, 0, 0, ?, ?, ?)
+        INSERT INTO teams (name, points, hints_used, created_at, members, assigned_challenge, auth_nonce)
+        VALUES (?, 0, 0, ?, ?, ?, ?)
         """,
-        (name, utc_now(), json.dumps(clean_members), assigned),
+        (name, utc_now(), json.dumps(clean_members), assigned, secrets.token_urlsafe(32)),
     )
     team_id = cur.lastrowid
+    db.execute(
+        """
+        INSERT INTO team_accounts (team_id, name, email, role, balance)
+        VALUES (?, ?, ?, 'user', 1000)
+        """,
+        (team_id, name, f"team-{team_id}@heist.local"),
+    )
     for cid in CHALLENGES:
         db.execute(
             "INSERT INTO challenge_progress (team_id, challenge_id) VALUES (?, ?)",
@@ -567,7 +1026,11 @@ def register_team():
     team = db.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
     return jsonify(
         {
-            "team": {**dict(team), "members": clean_members},
+            "team": public_team(team),
+            "accessToken": issue_team_token(team),
+            "tokenType": "Bearer",
+            "expiresIn": TOKEN_TTL_SECONDS,
+            "profileId": int(team["id"]),
             "assignedChallenge": assigned,
             "resumed": False,
             "session": read_session(db),
@@ -583,21 +1046,15 @@ def get_session():
 
 
 @app.post("/api/game/claim")
+@require_team
 def claim_challenge():
     """Assign the next open path challenge to a team (fixes null assignments)."""
-    data = request.get_json(silent=True) or {}
-    name = (data.get("teamName") or "").strip()
-    if not name:
-        return jsonify({"error": "teamName required"}), 400
-
     db = get_db()
     session, err = require_session_active(db)
     if err:
         return err
 
-    team = db.execute("SELECT * FROM teams WHERE name = ?", (name,)).fetchone()
-    if not team:
-        return jsonify({"error": "Team not found"}), 404
+    team = g.current_team
 
     assigned = team["assigned_challenge"]
     shared = session["challenges"].get(int(assigned), {}) if assigned else {}
@@ -606,7 +1063,7 @@ def claim_challenge():
             {
                 "assignedChallenge": int(assigned),
                 "session": session,
-                "team": {**dict(team), "members": json.loads(team["members"] or "[]")},
+                "team": public_team(team),
             }
         )
 
@@ -624,39 +1081,48 @@ def claim_challenge():
         {
             "assignedChallenge": nxt,
             "session": read_session(db),
-            "team": {**dict(team), "members": json.loads(team["members"] or "[]")},
+            "team": public_team(team),
             "message": f"Assigned challenge {nxt}",
         }
     )
 
 
 @app.post("/api/game/session/resume")
+@require_team
 def resume_session():
     db = get_db()
     session = read_session(db)
     if session["ended"] or session["remainingSeconds"] <= 0:
         persist_remaining(db, 0, False, True)
         return jsonify({"error": "Session time is over", "session": read_session(db)}), 403
+    assigned = g.current_team["assigned_challenge"]
+    if assigned is None or int(assigned) != session["nextChallenge"]:
+        return api_error("Only the team assigned to the next challenge may resume the session", 403)
     persist_remaining(db, session["remainingSeconds"], True, False)
     return jsonify(read_session(db))
 
 
 @app.post("/api/game/session/pause")
+@require_team
 def pause_session():
     db = get_db()
     session = read_session(db)
     if session["ended"]:
         return jsonify(session)
+    assigned = g.current_team["assigned_challenge"]
+    if assigned is None or int(assigned) != session["nextChallenge"]:
+        return api_error("Only the assigned team may pause the session", 403)
     persist_remaining(db, session["remainingSeconds"], False, False)
     return jsonify(read_session(db))
 
 
 @app.get("/api/game/state/<team_name>")
+@require_team
 def game_state(team_name: str):
     db = get_db()
-    team = db.execute("SELECT * FROM teams WHERE name = ?", (team_name,)).fetchone()
-    if not team:
-        return jsonify({"error": "Team not found"}), 404
+    team = g.current_team
+    if not hmac.compare_digest(team_name, team["name"]):
+        return api_error("Object access denied", 403)
     rows = db.execute(
         "SELECT * FROM challenge_progress WHERE team_id = ? ORDER BY challenge_id",
         (team["id"],),
@@ -674,7 +1140,7 @@ def game_state(team_name: str):
     members = json.loads(team["members"] or "[]")
     return jsonify(
         {
-            "team": {**dict(team), "members": members},
+            "team": public_team(team),
             "challenges": challenges,
             "session": read_session(db),
         }
@@ -682,11 +1148,16 @@ def game_state(team_name: str):
 
 
 @app.post("/api/game/hint")
+@require_team
 def reveal_hint():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("teamName") or "").strip()
-    challenge_id = int(data.get("challengeId") or 0)
-    hint_index = int(data.get("hintIndex") or 1)  # 0 = free, 1 = paid
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    try:
+        challenge_id = int(data.get("challengeId") or 0)
+        hint_index = int(data.get("hintIndex") if data.get("hintIndex") is not None else 1)
+    except (TypeError, ValueError):
+        return api_error("challengeId and hintIndex must be integers", 400)
 
     if challenge_id not in CHALLENGES:
         return jsonify({"error": "Invalid challenge"}), 400
@@ -698,9 +1169,9 @@ def reveal_hint():
     if err:
         return err
 
-    team = db.execute("SELECT * FROM teams WHERE name = ?", (name,)).fetchone()
-    if not team:
-        return jsonify({"error": "Team not found"}), 404
+    team = g.current_team
+    if int(team["assigned_challenge"] or 0) != challenge_id:
+        return api_error("This team is not assigned to that challenge", 403)
 
     progress = db.execute(
         "SELECT * FROM challenge_progress WHERE team_id = ? AND challenge_id = ?",
@@ -733,125 +1204,9 @@ def reveal_hint():
 
 
 @app.post("/api/game/submit-flag")
+@require_team
 def submit_flag():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("teamName") or "").strip()
-    challenge_id = int(data.get("challengeId") or 0)
-    flag = (data.get("flag") or "").strip()
-    elapsed = data.get("timeSeconds")
-
-    if challenge_id not in FLAGS:
-        return jsonify({"error": "Invalid challenge"}), 400
-
-    expected = FLAGS.get(challenge_id)
-    if flag != expected:
-        return jsonify({"success": False, "message": "Incorrect flag. Try harder!", "flag": None})
-
-    db = get_db()
-    session, err = require_session_active(db)
-    if err:
-        return err
-
-    team = db.execute("SELECT * FROM teams WHERE name = ?", (name,)).fetchone()
-    if not team:
-        return jsonify({"error": "Team not found"}), 404
-
-    assigned = team["assigned_challenge"]
-    if assigned and int(assigned) != challenge_id and challenge_id != 11:
-        return jsonify({"error": f"This team is assigned to challenge {assigned} only"}), 403
-
-    # Shared path: already solved by another team?
-    shared = db.execute(
-        "SELECT * FROM session_challenges WHERE challenge_id = ?", (challenge_id,)
-    ).fetchone()
-    if shared and shared["solved"]:
-        return jsonify(
-            {
-                "success": True,
-                "message": "Already solved for this session.",
-                "flag": expected,
-                "points_earned": 0,
-                "session": read_session(db),
-            }
-        )
-
-    if challenge_id == 11:
-        db.execute(
-            """
-            INSERT INTO challenge_progress (team_id, challenge_id, solved, solved_at, points_earned, time_seconds)
-            VALUES (?,?,1,?,?,?)
-            ON CONFLICT(team_id, challenge_id) DO UPDATE SET
-              solved = 1, solved_at = excluded.solved_at, points_earned = excluded.points_earned
-            """,
-            (team["id"], 11, utc_now(), 15, elapsed),
-        )
-        db.execute(
-            """
-            UPDATE session_challenges
-            SET solved = 1, solved_by = ?, points_earned = 15, time_seconds = ?
-            WHERE challenge_id = 11
-            """,
-            (name, elapsed),
-        )
-        db.execute("UPDATE teams SET points = points + 15 WHERE id = ?", (team["id"],))
-        session = read_session(db)
-        persist_remaining(db, session["remainingSeconds"], False, False)
-        return jsonify(
-            {
-                "success": True,
-                "message": "Final Boss defeated!",
-                "flag": expected,
-                "points_earned": 15,
-                "session": read_session(db),
-                "paused": True,
-            }
-        )
-
-    progress = db.execute(
-        "SELECT * FROM challenge_progress WHERE team_id = ? AND challenge_id = ?",
-        (team["id"], challenge_id),
-    ).fetchone()
-    if not progress:
-        return jsonify({"error": "Progress missing"}), 400
-
-    # 15 pts per challenge; paid hint costs 5 → 10 pts
-    earned = 10 if progress["hints_used"] >= 1 else 15
-    db.execute(
-        """
-        UPDATE challenge_progress
-        SET solved = 1, solved_at = ?, points_earned = ?, time_seconds = ?
-        WHERE id = ?
-        """,
-        (utc_now(), earned, elapsed, progress["id"]),
-    )
-    db.execute(
-        "UPDATE teams SET points = points + ?, total_time_seconds = total_time_seconds + ? WHERE id = ?",
-        (earned, int(elapsed or 0), team["id"]),
-    )
-    db.execute(
-        """
-        UPDATE session_challenges
-        SET solved = 1, solved_by = ?, points_earned = ?, time_seconds = ?
-        WHERE challenge_id = ?
-        """,
-        (name, earned, elapsed, challenge_id),
-    )
-    db.commit()
-
-    # Pause session timer between challenges
-    session = read_session(db)
-    persist_remaining(db, session["remainingSeconds"], False, False)
-
-    return jsonify(
-        {
-            "success": True,
-            "message": "Challenge complete! Timer paused — next team can register.",
-            "flag": expected,
-            "points_earned": earned,
-            "session": read_session(db),
-            "paused": True,
-        }
-    )
+    return api_error("Flag submission was retired in the hardened edition", 410)
 
 
 @app.get("/api/game/leaderboard")
@@ -878,9 +1233,13 @@ def leaderboard():
 
     team_list = []
     for t in teams:
-        item = dict(t)
-        item["members"] = json.loads(t["members"] or "[]")
-        team_list.append(item)
+        team_list.append(
+            {
+                "name": t["name"],
+                "points": int(t["points"]),
+                "total_time_seconds": int(t["total_time_seconds"]),
+            }
+        )
 
     return jsonify(
         {
@@ -904,14 +1263,22 @@ def leaderboard():
 
 @app.post("/api/game/restart")
 def restart_game():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
     full = bool(data.get("fullReset"))
     db = get_db()
     if full:
+        admin_error = authenticate_admin()
+        if admin_error:
+            return admin_error
         db.execute("DELETE FROM challenge_progress")
         db.execute("DELETE FROM teams")
         db.execute("DELETE FROM rate_counters")
+        db.execute("DELETE FROM registration_counters")
         db.execute("DELETE FROM transfer_counters")
+        db.execute("DELETE FROM transfers")
+        db.execute("DELETE FROM webhook_deliveries")
         db.execute("DELETE FROM session_challenges")
         for cid in range(1, 12):
             db.execute(
@@ -922,19 +1289,40 @@ def restart_game():
             "UPDATE game_session SET remaining_seconds = ?, running = 0, ended = 0, updated_at = ? WHERE id = 1",
             (SESSION_DURATION, time.time()),
         )
+        for user in DEMO_USERS:
+            db.execute(
+                "UPDATE users_demo SET name = ?, email = ?, role = ?, balance = ?, extra = ? WHERE id = ?",
+                (
+                    user["name"],
+                    user["email"],
+                    user["role"],
+                    user["balance"],
+                    json.dumps(
+                        {
+                            key: value
+                            for key, value in user.items()
+                            if key not in ("id", "name", "email", "role", "balance")
+                        }
+                    ),
+                    user["id"],
+                ),
+            )
         db.commit()
         return jsonify({"message": "Full game reset complete.", "session": read_session(db)})
 
-    name = (data.get("teamName") or "").strip()
-    if not name:
-        return jsonify({"error": "teamName or fullReset required"}), 400
-    team = db.execute("SELECT * FROM teams WHERE name = ?", (name,)).fetchone()
-    if not team:
-        return jsonify({"error": "Team not found"}), 404
+    team, auth_error = authenticate_team()
+    if auth_error:
+        return auth_error
+    name = team["name"]
+    supplied_name = data.get("teamName")
+    if supplied_name is not None and supplied_name != name:
+        return api_error("Object access denied", 403)
+    counter_key = f"team:{team['id']}"
     db.execute("DELETE FROM challenge_progress WHERE team_id = ?", (team["id"],))
     db.execute("DELETE FROM teams WHERE id = ?", (team["id"],))
-    db.execute("DELETE FROM rate_counters WHERE team_key = ?", (name,))
-    db.execute("DELETE FROM transfer_counters WHERE team_key = ?", (name,))
+    db.execute("DELETE FROM rate_counters WHERE team_key = ?", (counter_key,))
+    db.execute("DELETE FROM transfer_counters WHERE team_key = ?", (counter_key,))
+    db.execute("DELETE FROM transfers WHERE team_key = ?", (counter_key,))
     db.commit()
     return jsonify({"message": f"Team {name} reset."})
 
@@ -945,29 +1333,23 @@ def restart_game():
 
 
 @app.get("/api/user/<int:user_id>")
+@require_team
 def get_user(user_id: int):
     track_request(1)
+    if user_id != int(g.auth_claims["user_id"]):
+        return api_error("Object access denied", 403)
     db = get_db()
-    row = db.execute("SELECT * FROM users_demo WHERE id = ?", (user_id,)).fetchone()
+    row = db.execute("SELECT * FROM team_accounts WHERE team_id = ?", (user_id,)).fetchone()
     if not row:
-        return fail("User not found", status=404), 404
+        return api_error("User not found", 404)
     user = {
-        "id": row["id"],
+        "id": row["team_id"],
         "name": row["name"],
         "email": row["email"],
         "role": row["role"],
         "balance": row["balance"],
     }
-    extra = json.loads(row["extra"] or "{}")
-    user.update(extra)
-    if user_id == 3 and "secret_note" in user:
-        return ok(
-            "Challenge complete! You accessed another user's object.",
-            flag=FLAGS[1],
-            points_earned=15,
-            user=user,
-        )
-    return fail("Profile loaded. Nothing special here.", user=user)
+    return ok("Profile loaded.", user=user)
 
 
 # ---------------------------------------------------------------------------
@@ -976,35 +1358,10 @@ def get_user(user_id: int):
 
 
 @app.get("/api/admin")
+@require_admin
 def admin_panel():
     track_request(2)
-    auth = request.headers.get("Authorization", "")
-    token = auth.replace("Bearer ", "").strip()
-    if not token:
-        sample = jwt.encode({"sub": "guest", "role": "user"}, SECRET, algorithm="HS256")
-        return fail(
-            "Admin area requires Authorization: Bearer <jwt>",
-            sample_token=sample,
-            tip="Decode the JWT and inspect claims.",
-        )
-
-    # Intentionally weak: accept tokens with role=admin even if signature is wrong
-    try:
-        claims = jwt.decode(token, SECRET, algorithms=["HS256"])
-    except jwt.InvalidTokenError:
-        try:
-            claims = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
-        except Exception:
-            return fail("Malformed token.")
-
-    if str(claims.get("role", "")).lower() == "admin":
-        return ok(
-            "Challenge complete! Broken auth let you in.",
-            flag=FLAGS[2],
-            points_earned=15,
-            claims=claims,
-        )
-    return fail("Authenticated, but not an admin.", claims=claims)
+    return ok("Administrator authentication verified.", role="admin")
 
 
 # ---------------------------------------------------------------------------
@@ -1013,26 +1370,34 @@ def admin_panel():
 
 
 @app.put("/api/user/update")
+@require_team
 def update_user():
     track_request(3)
-    data = request.get_json(silent=True) or {}
-    # Intentionally vulnerable: merges entire body
-    user = {
-        "id": 1,
-        "name": data.get("name", "Alice"),
-        "email": data.get("email", "alice@heist.local"),
-        "role": "user",
-        "balance": 100,
-    }
-    user.update(data)
-    if str(user.get("role", "")).lower() == "admin":
-        return ok(
-            "Challenge complete! Mass assignment elevated your role.",
-            flag=FLAGS[3],
-            points_earned=15,
-            user=user,
-        )
-    return fail("Profile updated.", user=user)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    allowed = {"name", "email"}
+    forbidden = sorted(set(data) - allowed)
+    if forbidden:
+        return api_error("Immutable or unknown properties are not accepted", 400, fields=forbidden)
+    if not data:
+        return api_error("At least one editable property is required", 400)
+    try:
+        name = clean_text(data.get("name", "Alice"), field="name", maximum=80)
+        email = clean_text(data.get("email", "alice@heist.local"), field="email", maximum=254)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return api_error("email is invalid", 400)
+    user_id = int(g.auth_claims["user_id"])
+    db = get_db()
+    db.execute("UPDATE team_accounts SET name = ?, email = ? WHERE team_id = ?", (name, email, user_id))
+    db.commit()
+    row = db.execute(
+        "SELECT team_id AS id, name, email, role, balance FROM team_accounts WHERE team_id = ?",
+        (user_id,),
+    ).fetchone()
+    return ok("Profile updated.", user=dict(row))
 
 
 # ---------------------------------------------------------------------------
@@ -1041,46 +1406,38 @@ def update_user():
 
 
 @app.get("/api/rate-limited")
+@require_team
 def rate_limited():
     track_request(4)
     key = team_key_from_request()
     db = get_db()
     now = time.time()
+    db.execute("BEGIN IMMEDIATE")
     row = db.execute("SELECT * FROM rate_counters WHERE team_key = ?", (key,)).fetchone()
-    if not row:
-        db.execute(
-            "INSERT INTO rate_counters (team_key, count, window_start) VALUES (?, 1, ?)",
-            (key, now),
-        )
+    if not row or now - float(row["window_start"]) >= RATE_WINDOW_SECONDS:
+        if row:
+            db.execute(
+                "UPDATE rate_counters SET count = 1, window_start = ? WHERE team_key = ?",
+                (now, key),
+            )
+        else:
+            db.execute(
+                "INSERT INTO rate_counters (team_key, count, window_start) VALUES (?, 1, ?)",
+                (key, now),
+            )
         db.commit()
         count = 1
     else:
-        # Soft rate limit messaging, but still increments (intentionally bypassable)
-        count = row["count"] + 1
-        db.execute(
-            "UPDATE rate_counters SET count = ? WHERE team_key = ?",
-            (count, key),
-        )
+        if int(row["count"]) >= RATE_LIMIT:
+            retry_after = max(1, int(RATE_WINDOW_SECONDS - (now - float(row["window_start"]))))
+            db.commit()
+            response = jsonify({"error": "Rate limit exceeded"})
+            response.headers["Retry-After"] = str(retry_after)
+            return response, 429
+        count = int(row["count"]) + 1
+        db.execute("UPDATE rate_counters SET count = ? WHERE team_key = ?", (count, key))
         db.commit()
-        if count > 5 and (now - row["window_start"]) < 60 and count < 10:
-            return fail(
-                "Rate limit: 5 req/min (soft). Keep going...",
-                request_count=count,
-                remaining_soft=max(0, 5 - count),
-            ), 429
-
-    if count >= 10:
-        return ok(
-            "Challenge complete! You exhausted the soft limit.",
-            flag=FLAGS[4],
-            points_earned=15,
-            request_count=count,
-        )
-    return fail(
-        f"Request accepted ({count}/10 toward flag).",
-        request_count=count,
-        tip="Soft limit is 5/min — automation helps.",
-    )
+    return ok("Request accepted.", request_count=count, remaining=max(0, RATE_LIMIT - count))
 
 
 # ---------------------------------------------------------------------------
@@ -1089,14 +1446,12 @@ def rate_limited():
 
 
 @app.delete("/api/admin/users")
+@require_admin
 def delete_users():
     track_request(5)
-    # No auth check on purpose
     return ok(
-        "Challenge complete! Anyone could call this admin function.",
-        flag=FLAGS[5],
-        points_earned=15,
-        deleted=["demo-user-shadow"],
+        "Administrator authorization verified; no users were selected for deletion.",
+        deleted=[],
     )
 
 
@@ -1106,33 +1461,112 @@ def delete_users():
 
 
 @app.post("/api/transfer")
+@require_team
 def transfer():
     track_request(6)
-    data = request.get_json(silent=True) or {}
-    amount = data.get("amount", 1)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    amount = data.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        return api_error("amount must be an integer", 400)
+    if amount < 1 or amount > TRANSFER_MAX_AMOUNT:
+        return api_error(f"amount must be between 1 and {TRANSFER_MAX_AMOUNT}", 400)
+    recipient_ref = data.get("toUserId", data.get("to"))
+    if recipient_ref is None:
+        return api_error("toUserId or to is required", 400)
+    idempotency_key = request.headers.get("Idempotency-Key", "")
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", idempotency_key):
+        return api_error("A valid Idempotency-Key header is required", 400)
+
     key = team_key_from_request()
     db = get_db()
-    row = db.execute("SELECT * FROM transfer_counters WHERE team_key = ?", (key,)).fetchone()
-    if not row:
-        db.execute("INSERT INTO transfer_counters (team_key, count) VALUES (?, 1)", (key,))
-        count = 1
-    else:
-        count = row["count"] + 1
-        db.execute("UPDATE transfer_counters SET count = ? WHERE team_key = ?", (count, key))
-    db.commit()
-
-    if count >= 100:
+    db.execute("BEGIN IMMEDIATE")
+    existing = db.execute(
+        "SELECT * FROM transfers WHERE team_key = ? AND idempotency_key = ?",
+        (key, idempotency_key),
+    ).fetchone()
+    if existing:
+        if int(existing["amount"]) != amount:
+            db.rollback()
+            return api_error("Idempotency key was already used for a different request", 409)
+        db.commit()
         return ok(
-            "Challenge complete! Business flow abused.",
-            flag=FLAGS[6],
-            points_earned=15,
-            transfers=count,
-            amount=amount,
+            "Idempotent replay; the transfer was not repeated.",
+            idempotent_replay=True,
+            transfer={"id": existing["id"], "amount": existing["amount"]},
         )
-    return fail(
-        f"Transfer OK. Progress {count}/100.",
-        transfers=count,
-        amount=amount,
+
+    sender_id = int(g.auth_claims["user_id"])
+    sender = db.execute("SELECT * FROM team_accounts WHERE team_id = ?", (sender_id,)).fetchone()
+    if isinstance(recipient_ref, int) and not isinstance(recipient_ref, bool):
+        recipient = db.execute("SELECT * FROM users_demo WHERE id = ?", (recipient_ref,)).fetchone()
+    elif isinstance(recipient_ref, str) and recipient_ref.strip():
+        recipient = db.execute(
+            "SELECT * FROM users_demo WHERE lower(name) = lower(?)", (recipient_ref.strip(),)
+        ).fetchone()
+    else:
+        recipient = None
+    if not sender or not recipient:
+        db.rollback()
+        return api_error("Sender or recipient not found", 404)
+    if int(sender["balance"]) < amount:
+        db.rollback()
+        return api_error("Insufficient balance", 409)
+
+    now = time.time()
+    counter = db.execute(
+        "SELECT * FROM transfer_counters WHERE team_key = ?", (key,)
+    ).fetchone()
+    if not counter or now - float(counter["window_start"]) >= TRANSFER_WINDOW_SECONDS:
+        count = 0
+        total_amount = 0
+        if counter:
+            db.execute(
+                "UPDATE transfer_counters SET count = 0, total_amount = 0, window_start = ? WHERE team_key = ?",
+                (now, key),
+            )
+        else:
+            db.execute(
+                "INSERT INTO transfer_counters (team_key, count, window_start, total_amount) VALUES (?, 0, ?, 0)",
+                (key, now),
+            )
+    else:
+        count = int(counter["count"])
+        total_amount = int(counter["total_amount"])
+    if count >= TRANSFER_LIMIT_PER_WINDOW or total_amount + amount > TRANSFER_MAX_WINDOW_AMOUNT:
+        db.rollback()
+        return api_error("Transfer velocity limit exceeded", 429)
+
+    db.execute(
+        "UPDATE team_accounts SET balance = balance - ? WHERE team_id = ?", (amount, sender_id)
+    )
+    db.execute(
+        "UPDATE users_demo SET balance = balance + ? WHERE id = ?", (amount, recipient["id"])
+    )
+    cursor = db.execute(
+        """
+        INSERT INTO transfers
+            (team_key, idempotency_key, from_user_id, to_user_id, amount, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (key, idempotency_key, sender_id, recipient["id"], amount, now),
+    )
+    db.execute(
+        "UPDATE transfer_counters SET count = count + 1, total_amount = total_amount + ? WHERE team_key = ?",
+        (amount, key),
+    )
+    db.commit()
+    return ok(
+        "Transfer completed.",
+        idempotent_replay=False,
+        transfer={
+            "id": cursor.lastrowid,
+            "fromUserId": sender_id,
+            "toUserId": recipient["id"],
+            "amount": amount,
+        },
+        balance=int(sender["balance"]) - amount,
     )
 
 
@@ -1143,55 +1577,79 @@ def transfer():
 
 @app.get("/api/internal/flag")
 def internal_flag():
-    # Only meaningful when fetched via SSRF / loopback
-    return jsonify({"metadata": "heist-internal", "flag": FLAGS[7]})
+    return api_error("Not found", 404)
+
+
+class NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_host_is_allowed(host: str) -> bool:
+    return host in FETCH_ALLOWLIST
+
+
+def host_resolves_publicly(host: str, port: int) -> bool:
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+    if not addresses:
+        return False
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address[4][0])
+        except ValueError:
+            return False
+        if not ip.is_global:
+            return False
+    return True
 
 
 @app.post("/api/fetch-url")
+@require_team
 def fetch_url():
     track_request(7)
-    data = request.get_json(silent=True) or {}
-    url = (data.get("url") or "").strip()
-    if not url:
-        return fail("Provide JSON body: {\"url\": \"https://example.com\"}")
-
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    internal_hosts = {
-        "169.254.169.254",
-        "metadata.google.internal",
-        "127.0.0.1",
-        "localhost",
-        "0.0.0.0",
-    }
-
-    # Simulated cloud metadata without real network call
-    if host in {"169.254.169.254", "metadata.google.internal"} or "latest/meta-data" in url:
-        return ok(
-            "Challenge complete! SSRF hit internal metadata.",
-            flag=FLAGS[7],
-            points_earned=15,
-            fetched={
-                "url": url,
-                "body": {"ami-id": "ami-heist", "flag": FLAGS[7]},
-            },
-        )
-
-    if host in internal_hosts or host.startswith("127."):
-        return ok(
-            "Challenge complete! SSRF reached an internal service.",
-            flag=FLAGS[7],
-            points_earned=15,
-            fetched={"url": url, "note": "internal"},
-        )
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("url"), str):
+        return api_error("A JSON body containing url is required", 400)
+    url = data["url"].strip()
+    if len(url) > 2048:
+        return api_error("url is too long", 400)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port or 443
+    except ValueError:
+        return api_error("url is invalid", 400)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port != 443
+        or parsed.fragment
+    ):
+        return api_error("Only credential-free HTTPS URLs on port 443 are accepted", 400)
+    if not fetch_host_is_allowed(host):
+        return api_error("Destination host is not allowlisted", 403)
+    if not host_resolves_publicly(host, port):
+        return api_error("Destination must resolve only to public IP addresses", 403)
 
     try:
-        req = Request(url, headers={"User-Agent": "API-Heist-Academy/1.0"})
-        with urlopen(req, timeout=3) as resp:
-            body = resp.read(500).decode("utf-8", errors="replace")
-        return fail("Fetched external URL.", fetched={"url": url, "snippet": body[:200]})
-    except Exception as exc:
-        return fail(f"Fetch failed: {exc}", url=url)
+        opener = build_opener(NoRedirectHandler())
+        outbound = Request(url, headers={"User-Agent": "API-Heist-Academy/2.0"})
+        with opener.open(outbound, timeout=3) as response:
+            content_type = response.headers.get_content_type()
+            if not (content_type.startswith("text/") or content_type == "application/json"):
+                return api_error("Upstream content type is not accepted", 415)
+            body = response.read(FETCH_MAX_BYTES + 1)
+        if len(body) > FETCH_MAX_BYTES:
+            return api_error("Upstream response is too large", 502)
+        snippet = body.decode("utf-8", errors="replace")[:500]
+        return ok("Allowlisted URL fetched.", fetched={"url": url, "snippet": snippet})
+    except Exception:
+        return api_error("Upstream fetch failed", 502)
 
 
 # ---------------------------------------------------------------------------
@@ -1201,27 +1659,7 @@ def fetch_url():
 
 @app.get("/api/debug")
 def debug_endpoint():
-    track_request(8)
-    if request.args.get("crash") == "1":
-        # Intentionally leak flag in error payload
-        return (
-            jsonify(
-                {
-                    "success": False,
-                    "message": "Internal Server Error",
-                    "error": "ZeroDivisionError: division by zero",
-                    "traceback": [
-                        'File "app.py", line 418, in debug_endpoint',
-                        "  secret = CONFIG['DEBUG_FLAG']",
-                        f"  DEBUG_FLAG = '{FLAGS[8]}'",
-                    ],
-                    "flag": FLAGS[8],
-                    "hint_used": False,
-                }
-            ),
-            500,
-        )
-    return fail("Debug endpoint healthy. Try forcing an error.", tip="?crash=1")
+    return api_error("Not found", 404)
 
 
 # ---------------------------------------------------------------------------
@@ -1230,26 +1668,27 @@ def debug_endpoint():
 
 
 @app.get("/api/v2/users")
+@require_team
 def users_v2():
+    user_id = int(g.auth_claims["user_id"])
+    row = get_db().execute(
+        "SELECT team_id AS id, name FROM team_accounts WHERE team_id = ?", (user_id,)
+    ).fetchone()
     return jsonify(
         {
             "version": "v2",
-            "users": [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}],
-            "note": "Current API. Old versions may still exist.",
+            "users": [dict(row)] if row else [],
         }
     )
 
 
 @app.get("/api/v1/users")
 def users_v1():
-    track_request(9)
-    return ok(
-        "Challenge complete! Deprecated inventory still exposed.",
-        flag=FLAGS[9],
-        points_earned=15,
-        version="v1-DEPRECATED",
-        users=DEMO_USERS,
-    )
+    response = jsonify({"error": "API v1 has been retired; use /api/v2/users"})
+    response.headers["Deprecation"] = "true"
+    response.headers["Sunset"] = "Sat, 22 Aug 2026 00:00:00 GMT"
+    response.headers["Link"] = '</api/v2/users>; rel="successor-version"'
+    return response, 410
 
 
 # ---------------------------------------------------------------------------
@@ -1259,28 +1698,60 @@ def users_v1():
 
 @app.post("/api/webhook")
 def webhook():
-    track_request(10)
-    data = request.get_json(silent=True) or {}
-    event = str(data.get("event", "ping"))
-    payload = data.get("payload", data.get("body", ""))
+    if not WEBHOOK_SECRET:
+        return api_error("Webhook processing is disabled until DVAPI_WEBHOOK_SECRET is configured", 503)
+    raw_body = request.get_data(cache=True)
+    timestamp_header = request.headers.get("X-Webhook-Timestamp", "")
+    signature = request.headers.get("X-Webhook-Signature", "")
+    try:
+        timestamp = int(timestamp_header)
+    except ValueError:
+        return api_error("Webhook authentication failed", 401)
+    now = int(time.time())
+    if timestamp > now + 30 or now - timestamp > WEBHOOK_MAX_AGE_SECONDS:
+        return api_error("Webhook authentication failed", 401)
+    if not re.fullmatch(r"sha256=[0-9a-f]{64}", signature):
+        return api_error("Webhook authentication failed", 401)
+    expected = "sha256=" + hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        timestamp_header.encode("ascii") + b"." + raw_body,
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return api_error("Webhook authentication failed", 401)
 
-    dangerous = {
-        "__flag__",
-        "{{FLAG}}",
-        "${FLAG}",
-        "FLAG",
-        "eval",
-        "__import__",
-    }
-    blob = f"{event} {payload}".upper()
-    if event in {"__flag__", "inject", "eval"} or any(d.upper() in blob for d in dangerous):
-        return ok(
-            "Challenge complete! Unsafe webhook consumption.",
-            flag=FLAGS[10],
-            points_earned=15,
-            processed=True,
-        )
-    return fail("Webhook accepted.", event=event, processed=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return api_error("A JSON object is required", 400)
+    event = data.get("event")
+    if event not in {"ping", "transfer.completed", "user.updated"}:
+        return api_error("Unsupported webhook event", 400)
+    if "payload" not in data:
+        return api_error("payload is required", 400)
+    payload = data["payload"]
+    try:
+        encoded_payload = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return api_error("payload is invalid", 400)
+    if len(encoded_payload.encode("utf-8")) > 4096:
+        return api_error("payload is too large", 400)
+
+    db = get_db()
+    db.execute(
+        "DELETE FROM webhook_deliveries WHERE received_at < ?",
+        (time.time() - (WEBHOOK_MAX_AGE_SECONDS * 2),),
+    )
+    if db.execute(
+        "SELECT 1 FROM webhook_deliveries WHERE signature = ?", (signature,)
+    ).fetchone():
+        db.commit()
+        return api_error("Webhook replay rejected", 409)
+    db.execute(
+        "INSERT INTO webhook_deliveries (signature, received_at) VALUES (?, ?)",
+        (signature, time.time()),
+    )
+    db.commit()
+    return jsonify({"accepted": True, "event": event}), 202
 
 
 # ---------------------------------------------------------------------------
@@ -1290,24 +1761,7 @@ def webhook():
 
 @app.post("/api/ultimate-challenge")
 def ultimate_challenge():
-    data = request.get_json(silent=True) or {}
-    answers = data.get("flags") or data.get("answers") or []
-    if isinstance(answers, dict):
-        answers = list(answers.values())
-    needed = [FLAGS[i] for i in range(1, 11)]
-    matched = sum(1 for f in needed if f in answers)
-    if matched >= 10:
-        return ok(
-            "FINAL BOSS CLEAR — the heist is complete!",
-            flag=FLAGS[11],
-            points_earned=15,
-            matched=matched,
-        )
-    return fail(
-        f"Need all 10 challenge flags. Matched {matched}/10.",
-        matched=matched,
-        tip='POST {"flags": ["FLAG{...}", ...]} with all ten flags.',
-    )
+    return api_error("The flag aggregation endpoint was retired in the hardened edition", 410)
 
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1771,7 @@ def ultimate_challenge():
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "service": "API Heist Academy", "bind": f"{HOST}:{PORT}"})
+    return jsonify({"status": "ok", "service": "API Heist Academy"})
 
 
 @app.get("/")
@@ -1327,8 +1781,11 @@ def index():
 
 @app.get("/<path:path>")
 def static_proxy(path: str):
-    target = STATIC_DIR / path
-    if target.is_file():
+    if path.startswith("api/"):
+        return api_error("Not found", 404)
+    static_root = STATIC_DIR.resolve()
+    target = (STATIC_DIR / path).resolve()
+    if target.is_relative_to(static_root) and target.is_file():
         return send_from_directory(STATIC_DIR, path)
     return send_from_directory(STATIC_DIR, "index.html")
 
@@ -1338,8 +1795,11 @@ init_db()
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("API Heist Academy — EDUCATIONAL LAB ONLY")
+    print("API Heist Academy — HARDENED EDITION")
     print(f"Serving on http://{HOST}:{PORT}")
-    print("Do NOT expose this service to the public internet.")
+    if not ADMIN_TOKEN:
+        print("Admin operations disabled: configure DVAPI_ADMIN_TOKEN to enable them.")
+    if not WEBHOOK_SECRET:
+        print("Webhook processing disabled: configure DVAPI_WEBHOOK_SECRET to enable it.")
     print("=" * 60)
     app.run(host=HOST, port=PORT, debug=False)

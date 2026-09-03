@@ -1,13 +1,16 @@
 {
   "info": {
-    "name": "API Heist Academy - Starter Kit",
-    "description": "Baseline requests only. Explore, modify, and discover — solutions are intentionally omitted. Local educational lab.",
+    "name": "API Heist Academy - Hardened Verification",
+    "description": "Authenticated requests and negative tests for the hardened OWASP API Top 10 controls.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     { "key": "baseUrl", "value": "http://127.0.0.1:5000/api" },
     { "key": "teamName", "value": "Alpha" },
-    { "key": "token", "value": "" }
+    { "key": "token", "value": "" },
+    { "key": "profileId", "value": "" },
+    { "key": "adminToken", "value": "" },
+    { "key": "webhookSecret", "value": "" }
   ],
   "item": [
     {
@@ -36,10 +39,22 @@
             "header": [{ "key": "Content-Type", "value": "application/json" }],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"teamName\": \"{{teamName}}\"\n}"
+              "raw": "{\n  \"teamName\": \"{{teamName}}\",\n  \"members\": [\"Security Student\"]\n}"
             },
             "url": "{{baseUrl}}/game/register"
-          }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.accessToken) pm.collectionVariables.set('token', body.accessToken);",
+                  "if (body.profileId) pm.collectionVariables.set('profileId', body.profileId);"
+                ]
+              }
+            }
+          ]
         }
       ]
     },
@@ -50,8 +65,8 @@
           "name": "Get my profile",
           "request": {
             "method": "GET",
-            "header": [{ "key": "X-Team-Name", "value": "{{teamName}}" }],
-            "url": "{{baseUrl}}/user/1"
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+            "url": "{{baseUrl}}/user/{{profileId}}"
           }
         }
       ]
@@ -64,8 +79,7 @@
           "request": {
             "method": "GET",
             "header": [
-              { "key": "X-Team-Name", "value": "{{teamName}}" },
-              { "key": "Authorization", "value": "Bearer {{token}}" }
+              { "key": "X-Admin-Token", "value": "{{adminToken}}" }
             ],
             "url": "{{baseUrl}}/admin"
           }
@@ -80,7 +94,7 @@
           "request": {
             "method": "PUT",
             "header": [
-              { "key": "X-Team-Name", "value": "{{teamName}}" },
+              { "key": "Authorization", "value": "Bearer {{token}}" },
               { "key": "Content-Type", "value": "application/json" }
             ],
             "body": {
@@ -99,7 +113,7 @@
           "name": "Call rate-limited route",
           "request": {
             "method": "GET",
-            "header": [{ "key": "X-Team-Name", "value": "{{teamName}}" }],
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
             "url": "{{baseUrl}}/rate-limited"
           }
         }
@@ -112,7 +126,7 @@
           "name": "Admin users action",
           "request": {
             "method": "DELETE",
-            "header": [{ "key": "X-Team-Name", "value": "{{teamName}}" }],
+            "header": [{ "key": "X-Admin-Token", "value": "{{adminToken}}" }],
             "url": "{{baseUrl}}/admin/users"
           }
         }
@@ -126,7 +140,8 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "X-Team-Name", "value": "{{teamName}}" },
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Idempotency-Key", "value": "{{$guid}}" },
               { "key": "Content-Type", "value": "application/json" }
             ],
             "body": {
@@ -146,7 +161,7 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "X-Team-Name", "value": "{{teamName}}" },
+              { "key": "Authorization", "value": "Bearer {{token}}" },
               { "key": "Content-Type", "value": "application/json" }
             ],
             "body": {
@@ -165,7 +180,7 @@
           "name": "Debug endpoint",
           "request": {
             "method": "GET",
-            "header": [{ "key": "X-Team-Name", "value": "{{teamName}}" }],
+            "header": [],
             "url": "{{baseUrl}}/debug"
           }
         }
@@ -178,7 +193,7 @@
           "name": "List users (current)",
           "request": {
             "method": "GET",
-            "header": [{ "key": "X-Team-Name", "value": "{{teamName}}" }],
+            "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
             "url": "{{baseUrl}}/v2/users"
           }
         }
@@ -192,7 +207,8 @@
           "request": {
             "method": "POST",
             "header": [
-              { "key": "X-Team-Name", "value": "{{teamName}}" },
+              { "key": "X-Webhook-Timestamp", "value": "{{webhookTimestamp}}" },
+              { "key": "X-Webhook-Signature", "value": "{{webhookSignature}}" },
               { "key": "Content-Type", "value": "application/json" }
             ],
             "body": {
@@ -200,36 +216,53 @@
               "raw": "{\n  \"event\": \"ping\",\n  \"payload\": \"hello\"\n}"
             },
             "url": "{{baseUrl}}/webhook"
-          }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "exec": [
+                  "const CryptoJS = require('crypto-js');",
+                  "const timestamp = Math.floor(Date.now() / 1000).toString();",
+                  "const raw = pm.request.body.raw;",
+                  "const digest = CryptoJS.HmacSHA256(`${timestamp}.${raw}`, pm.collectionVariables.get('webhookSecret')).toString(CryptoJS.enc.Hex);",
+                  "pm.collectionVariables.set('webhookTimestamp', timestamp);",
+                  "pm.collectionVariables.set('webhookSignature', `sha256=${digest}`);"
+                ]
+              }
+            }
+          ]
         }
       ]
     },
     {
-      "name": "11 Endgame",
+      "name": "11 Retired endpoints",
       "item": [
         {
-          "name": "Ultimate challenge",
+          "name": "Verify ultimate endpoint is retired",
           "request": {
             "method": "POST",
             "header": [
-              { "key": "X-Team-Name", "value": "{{teamName}}" },
               { "key": "Content-Type", "value": "application/json" }
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"flags\": []\n}"
+              "raw": "{}"
             },
             "url": "{{baseUrl}}/ultimate-challenge"
           }
         },
         {
-          "name": "Submit flag (UI mirror)",
+          "name": "Verify submission endpoint is retired",
           "request": {
             "method": "POST",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{token}}" },
+              { "key": "Content-Type", "value": "application/json" }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"teamName\": \"{{teamName}}\",\n  \"challengeId\": 1,\n  \"flag\": \"\",\n  \"timeSeconds\": 0\n}"
+              "raw": "{}"
             },
             "url": "{{baseUrl}}/game/submit-flag"
           }

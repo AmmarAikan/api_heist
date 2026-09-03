@@ -1,51 +1,45 @@
-# Student Cheat Sheet — Attack Patterns
+# Hardened API verification sheet
 
-Use with **Postman** or **Burp**. Base URL: `http://127.0.0.1:5000/api`  
-Always send header: `X-Team-Name: YourTeam`
+## 1. Register and capture the token
 
-Submit flags in the UI. Pattern reference only — discover the exact payloads yourself.
+```http
+POST /api/game/register
+Content-Type: application/json
 
----
+{"teamName":"Alpha","members":["Student"]}
+```
 
-### 1. BOLA — IDOR
-Change resource IDs in the path/query. Ask: *Can I read objects that are not mine?*
+Copy `accessToken` and `profileId` from the response. Protected requests require:
 
-### 2. Broken Authentication
-Inspect tokens (JWT). Tamper with claims (`role`, `admin`, `sub`). Check whether the server verifies signatures.
+```http
+Authorization: Bearer <accessToken>
+```
 
-### 3. Mass Assignment
-Add unexpected JSON fields when updating a profile (`role`, `isAdmin`, `balance`).
+`X-Team-Name` is not authentication and is ignored.
 
-### 4. Unrestricted Resource Consumption
-Automate repeated requests. Watch counters and soft limits. Collection Runner / Intruder help.
+## 2. Expected defensive results
 
-### 5. Broken Function Level Authorization
-Call admin verbs/paths (`DELETE`, `/admin/...`) as a normal user.
+| Verification | Expected result |
+|---|---|
+| Own `GET /api/user/{profileId}` | `200` |
+| Another profile ID | `403` |
+| Forged or expired JWT | `401` |
+| Update `role` or `balance` | `400` |
+| More than five limited requests per minute | persistent `429` |
+| Team token on an admin route | `401` |
+| Negative transfer amount | `400` |
+| Transfer without `Idempotency-Key` | `400` |
+| Link-local or non-allowlisted fetch | `400` or `403` |
+| `/api/debug?crash=1` | `404` without a traceback |
+| `/api/v1/users` | `410` without user records |
+| Unsigned webhook | `401` |
+| Replayed valid webhook | `409` |
 
-### 6. Business Flow Abuse
-Legitimate action, illegitimate volume — script the happy path hundreds of times.
+## 3. Retired functions
 
-### 7. SSRF
-Point URL-fetch features at internal targets (link-local metadata, localhost services).
+The exploit-proof submission and final aggregation endpoints are no longer part of the game flow:
 
-### 8. Security Misconfiguration
-Force errors/debug modes. Read stack traces and verbose responses carefully.
+- `POST /api/game/submit-flag` → `410`
+- `POST /api/ultimate-challenge` → `410`
 
-### 9. Improper Inventory Management
-Try older versions (`/v1/`, `/internal/`, undocumented paths) even if docs show `/v2/`.
-
-### 10. Unsafe Consumption of APIs
-Treat inbound webhooks as untrusted. Probe unusual `event` / payload values.
-
----
-
-## Flag format
-
-`FLAG{ChallengeName_SomeString}`
-
-## Hot seat rules
-
-- 100-minute session clock for the whole class (pauses between challenges)  
-- Free hint OK  
-- Second hint costs points  
-- Pass the keyboard when time is up  
+Use the Arabic security report for the before/after evidence and remediation details.
